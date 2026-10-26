@@ -1,0 +1,45 @@
+name: env-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - name: env
+        run: |
+          sw_vers
+          uname -a
+          id
+          csrutil status || true
+          echo "---"
+          ls -ld /System/Volumes/Data || true
+
+      - name: build and run tiny path probe
+        run: |
+          set -x
+          mkdir -p /tmp/p
+          cat > /tmp/p/pp.c <<'CEOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <libproc.h>
+          int main(int argc, char **argv) {
+            char buf[4096];
+            memset(buf, 0, sizeof buf);
+            int n = proc_pidpath(getpid(), buf, sizeof buf);
+            printf("argv0        = %s\n", argv[0]);
+            printf("proc_pidpath = %s (n=%d)\n", n > 0 ? buf : "(failed)", n);
+            return 0;
+          }
+          CEOF
+          clang -O0 -o /tmp/p/pp /tmp/p/pp.c
+          /tmp/p/pp
+          echo "----- via /System/Volumes/Data -----"
+          D="/System/Volumes/Data/Users/$USER/pp"
+          cp /tmp/p/pp "$D" && "$D"
+          echo "----- via /System/Volumes/Data/private/tmp -----"
+          mkdir -p /System/Volumes/Data/private/tmp/ppd
+          cp /tmp/p/pp /System/Volumes/Data/private/tmp/ppd/pp
+          /System/Volumes/Data/private/tmp/ppd/pp
