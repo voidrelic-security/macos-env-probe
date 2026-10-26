@@ -1,0 +1,112 @@
+name: airportd-deep
+on:
+  workflow_dispatch:
+
+jobs:
+  deep:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: trace airportd key lookups
+        run: |
+          set +e
+          PID=$(pgrep -x airportd | head -1)
+          echo "airportd PID=$PID"
+          cat > /tmp/w/air_trace.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_dictionary_get_uint64
+          br s -n xpc_dictionary_get_value
+          br s -n xpc_dictionary_get_string
+          br s -n xpc_dictionary_get_int64
+          br s -n xpc_dictionary_get_bool
+          br s -n xpc_dictionary_get_array
+          br s -n xpc_dictionary_get_data
+          br command add 1
+          printf "UINT64: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 2
+          printf "VALUE: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 3
+          printf "STRING: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 4
+          printf "INT64: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 5
+          printf "BOOL: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 6
+          printf "ARRAY: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 7
+          printf "DATA: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/air_trace.lldb > /tmp/w/air_trace.log 2>&1 ) &
+          LP=$!
+          sleep 8
+          echo "--- sending probes to airportd ---"
+          # 用多种消息格式探测 airportd
+          python3 - <<'PY'
+          import subprocess
+          # 发一些常见格式的消息
+          codes = [
+              # CoreWiFi 常见 type 值
+              ('type', 1), ('type', 2), ('type', 3), ('type', 4),
+              ('msg_type', 1), ('msg_type', 2),
+              ('request', 1), ('command', 1),
+          ]
+          for key, val in codes:
+              subprocess.run(['defaults', 'write', '/tmp/w/air_probe', key, str(val)], capture_output=True)
+          print("probes prepared")
+          PY
+          # 用 airportd 命令行工具触发（airport 命令）
+          /System/Library/PrivateFrameworks/Apple80211.framework/Versions/A/Resources/airport -I 2>&1 | head -5
+          networksetup -listallhardwareports 2>&1 | grep -A2 Wi-Fi | head -5
+          # airportd 自身的正常操作也会触发键名读取
+          networksetup -setairportpower en0 off 2>&1 | head -3
+          networksetup -setairportpower en0 on 2>&1 | head -3
+          sleep 20
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          sleep 2
+          echo "=== airportd 读取的所有键名 ==="
+          grep -E "^(UINT64|VALUE|STRING|INT64|BOOL|ARRAY|DATA):" /tmp/w/air_trace.log | sort -u | head -60
+          echo
+          echo "=== 总键名数 ==="
+          grep -cE "^(UINT64|VALUE|STRING|INT64|BOOL|ARRAY|DATA):" /tmp/w/air_trace.log
+          true
+        continue-on-error: true
+
+      - name: disassemble airportd connection handler
+        run: |
+          set +e
+          PID=$(pgrep -x airportd | head -1)
+          echo "airportd PID=$PID"
+          # 找 airportd 的 shouldAcceptNewConnection
+          sudo lldb -b -p "$PID" \
+            -o "image lookup -rn shouldAcceptNewConnection" \
+            -o "detach" -o "quit" 2>&1 | tail -15
+          echo
+          # 找 ObjC 类名
+          otool -oV /usr/libexec/airportd 2>/dev/null | grep -E "class_name|metaClass" | head -20
+          echo
+          # 找所有 respondsToSelector 的 selector
+          strings -a /usr/libexec/airportd | grep -E "^(handle|process|did|will)[A-Z]" | sort -u | head -30
+          true
+        continue-on-error: true
