@@ -1,0 +1,118 @@
+name: dmg-parse-fuzz
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 'mutation rounds'
+        default: '250'
+
+jobs:
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: env
+        run: |
+          set +e
+          sw_vers
+          echo "--- hdiutil ---"
+          hdiutil version
+          echo "--- diskimages-helper ---"
+          ls -la /System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper 2>&1
+          ls -la /System/Library/PrivateFrameworks/DiskImages2.framework/Versions/A/XPCServices/ 2>&1 | head -20
+          echo "--- codesign of hdiutil ---"
+          codesign -dv /usr/bin/hdiutil 2>&1 | head -8
+
+      - name: create valid dmg
+        run: |
+          set -x
+          mkdir -p /tmp/d
+          cd /tmp/d
+          # 建一个原始镜像再转成 UDZO
+          hdiutil create -size 2m -fs HFS+ -volname T -ov /tmp/d/raw.dmg
+          hdiutil convert /tmp/d/raw.dmg -format UDZO -o /tmp/d/valid.dmg
+          ls -la /tmp/d/
+          echo "--- 头 64 字节 ---"
+          xxd -l 64 /tmp/d/valid.dmg
+          echo "--- 尾 512 字节（koly trailer）---"
+          tail -c 512 /tmp/d/valid.dmg | xxd | head -20
+          echo "--- imageinfo 基线 ---"
+          hdiutil imageinfo /tmp/d/valid.dmg 2>&1 | head -20
+
+      - name: mutation fuzz imageinfo
+        run: |
+          set +e
+          python3 - <<'PY'
+          import os, random, subprocess, shutil, sys
+
+          valid = '/tmp/d/valid.dmg'
+          data = open(valid, 'rb').read()
+          n = len(data)
+          print('valid size =', n)
+          random.seed(0x5eed)
+
+          rounds = int(os.environ.get('ROUNDS', '250'))
+          crashes = []
+          other = 0
+
+          # 重点区域：头部 1KB、koly trailer 最后 512B、以及随机偏移
+          def pick_offsets():
+              r = random.random()
+              if r < 0.35:
+                  return [random.randrange(0, min(1024, n))]
+              if r < 0.75:
+                  return [n - 512 + random.randrange(0, 512)]
+              return [random.randrange(0, n)]
+
+          for i in range(rounds):
+              b = bytearray(data)
+              for _ in range(random.choice([1, 2, 4, 8])):
+                  for off in pick_offsets():
+                      if 0 <= off < n:
+                          b[off] = random.randrange(0, 256)
+              # 偶尔截断
+              if random.random() < 0.10:
+                  b = b[:random.randrange(max(1, n // 2), n)]
+              p = '/tmp/d/mut.dmg'
+              open(p, 'wb').write(bytes(b))
+              try:
+                  r = subprocess.run(['hdiutil', 'imageinfo', p],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     timeout=8)
+                  rc = r.returncode
+              except subprocess.TimeoutExpired:
+                  rc = -999
+              if rc < 0 or rc >= 128:
+                  crashes.append((i, rc, len(b)))
+                  shutil.copy(p, '/tmp/d/crash_%d_rc%d.dmg' % (i, rc))
+                  print('!!! CRASH round=%d rc=%d size=%d' % (i, rc, len(b)))
+              else:
+                  other += 1
+          print('rounds=%d  crashes=%d  clean=%d' % (rounds, len(crashes), other))
+          if crashes:
+              print('CRASH LIST:', crashes[:20])
+          PY
+
+      - name: crash triage
+        if: always()
+        run: |
+          set +e
+          ls -la /tmp/d/crash_*.dmg 2>/dev/null | head -10
+          for f in /tmp/d/crash_*.dmg; do
+            [ -e "$f" ] || continue
+            echo "===== $f"
+            hdiutil imageinfo "$f" 2>&1 | head -5
+            echo "rc=$?"
+          done
+          echo "--- 最近的崩溃报告 ---"
+          ls -lat ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -10
+
+      - name: upload crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-crashes
+          path: /tmp/d/crash_*.dmg
+          if-no-files-found: ignore
+          retention-days: 3
