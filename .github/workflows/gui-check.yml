@@ -1,6 +1,7 @@
 name: gui-check
 on:
   workflow_dispatch:
+
 jobs:
   chk:
     runs-on: macos-15
@@ -14,16 +15,11 @@ jobs:
           pgrep -lf loginwindow
           echo "=== gui domain ==="
           launchctl print gui/501 2>&1 | head -12
-          echo "=== 是否有显示设备 ==="
+          echo "=== IOFramebuffer count ==="
           ioreg -rc IOFramebuffer 2>/dev/null | grep -c IOFramebuffer
-          echo "=== 当前 console user ==="
+          echo "=== console user ==="
           stat -f%Su /dev/console
-          echo "=== WindowServer 的 mach service ==="
-          launchctl print system/com.apple.WindowServer 2>&1 | head -20
-          echo "=== 是否有 Aqua session ==="
-          /usr/bin/python3 -c "
-import subprocess
-r=subprocess.run(['launchctl','print','gui/501'],capture_output=True,text=True)
-print('gui/501 rc=',r.returncode)
-print([l for l in r.stdout.splitlines() if 'WindowServer' in l][:5])
-"
+          echo "=== WindowServer job ==="
+          launchctl print system/com.apple.WindowServer 2>&1 | head -15
+          echo "=== SkyLight present ==="
+          ls -la /System/Library/PrivateFrameworks/SkyLight.framework 2>&1 | head -3
