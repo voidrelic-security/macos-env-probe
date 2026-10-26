@@ -1,0 +1,107 @@
+name: dmg-fuzz4
+on:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: build valid dmg + locate xml by magic
+        run: |
+          set -x
+          mkdir -p /tmp/d && cd /tmp/d
+          hdiutil create -size 2m -fs HFS+ -volname T -ov /tmp/d/raw.dmg >/dev/null
+          hdiutil convert /tmp/d/raw.dmg -format UDZO -o /tmp/d/valid.dmg >/dev/null
+          ls -la /tmp/d/valid.dmg
+          python3 - <<'PY'
+          d=open('/tmp/d/valid.dmg','rb').read()
+          n=len(d)
+          for magic in (b'<?xml', b'bplist00'):
+              p=d.find(magic)
+              print('magic', magic, 'at', p)
+          p=d.rfind(b'koly')
+          print('koly at', p, 'n-p=', n-p)
+          x=d.find(b'<?xml')
+          if x>=0:
+              print('xml head:', d[x:x+120])
+              print('xml tail:', d[max(x, p-80):p])
+          PY
+
+      - name: structured fuzz on XML blkx + attach
+        run: |
+          set +e
+          python3 - <<'PY'
+          import struct, subprocess, random, shutil, os, time
+          d = open('/tmp/d/valid.dmg','rb').read()
+          n = len(d)
+          x = d.find(b'<?xml')
+          p = d.rfind(b'koly')
+          assert x >= 0 and p > x, 'cannot locate xml/trailer'
+          xml_len = p - x
+          print('xml region [%d, %d) len=%d ; trailer at %d' % (x, p, xml_len, p))
+
+          random.seed(0xFEEDFACE)
+          rounds = 100
+          crashes, hangs, rcs = [], 0, {}
+          for i in range(rounds):
+              b = bytearray(d)
+              # 变异 XML / blkx 区（真正的解析输入）
+              for _ in range(random.choice([1,2,4,8,16])):
+                  off = x + random.randrange(0, xml_len)
+                  b[off] = random.randrange(0,256)
+              # 有时把 blkx 里的 base64 段整体改掉
+              if random.random() < 0.25:
+                  seg = random.randrange(0, max(1, xml_len-64))
+                  for k in range(64):
+                      b[x+seg+k] = random.choice(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=')
+              open('/tmp/d/mut.dmg','wb').write(bytes(b))
+
+              # 1) imageinfo（用户态解析）
+              try:
+                  r = subprocess.run(['hdiutil','imageinfo','/tmp/d/mut.dmg'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
+                  rc = r.returncode
+              except subprocess.TimeoutExpired:
+                  rc = -999; hangs += 1
+              rcs[rc] = rcs.get(rc,0)+1
+              if rc < 0 or rc >= 128:
+                  crashes.append((i,'imageinfo',rc)); shutil.copy('/tmp/d/mut.dmg','/tmp/d/crash_%d_info_rc%d.dmg'%(i,rc))
+                  print('!!! CRASH imageinfo round=%d rc=%d'%(i,rc), flush=True)
+
+              # 2) 每 5 轮打一次 attach（特权路径 diskimages-helper）
+              if i % 5 == 0:
+                  try:
+                      r = subprocess.run(['hdiutil','attach','-nomount','-readonly','-noverify','/tmp/d/mut.dmg'],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                      arc = r.returncode
+                  except subprocess.TimeoutExpired:
+                      arc = -999
+                  if arc < 0 or arc >= 128:
+                      crashes.append((i,'attach',arc)); shutil.copy('/tmp/d/mut.dmg','/tmp/d/crash_%d_att_rc%d.dmg'%(i,arc))
+                      print('!!! CRASH attach round=%d rc=%d'%(i,arc), flush=True)
+                  subprocess.run(['hdiutil','detach','-force','/dev/disk9'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if i % 20 == 0: print('  progress',i,'crashes',len(crashes),'hangs',hangs, flush=True)
+
+          print('rounds=%d crashes=%d hangs=%d rc-hist=%s' % (rounds,len(crashes),hangs,rcs))
+          if crashes: print('CRASH LIST:', crashes[:20])
+          PY
+
+      - name: triage
+        if: always()
+        run: |
+          set +e
+          ls -la /tmp/d/crash_*.dmg 2>/dev/null
+          echo "--- DiagnosticReports ---"
+          ls -lat ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -10
+          echo "--- system DiagnosticReports ---"
+          sudo ls -lat /Library/Logs/DiagnosticReports/ 2>/dev/null | head -10
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-crashes4
+          path: /tmp/d/crash_*.dmg
+          if-no-files-found: ignore
+          retention-days: 3
