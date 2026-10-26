@@ -1,0 +1,89 @@
+name: unpack-slip-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: build evil archives
+        run: |
+          set -x
+          python3 - <<'PY'
+          import zipfile, tarfile, io, os
+
+          os.makedirs('/tmp/evil', exist_ok=True)
+
+          # --- zip: 相对路径穿越 + 绝对路径 ---
+          with zipfile.ZipFile('/tmp/evil/slip.zip','w') as z:
+              z.writestr('../../escaped_zip.txt', 'ZIP-SLIP-REL')
+              z.writestr('/tmp/abs_zip.txt', 'ZIP-SLIP-ABS')
+              z.writestr('normal.txt', 'ok')
+
+          # --- zip: 符号链接 + 通过链接写 ---
+          zi = zipfile.ZipInfo('link')
+          zi.external_attr = (0o120777 << 16)
+          with zipfile.ZipFile('/tmp/evil/symlink.zip','w') as z:
+              z.writestr(zi, '/tmp')
+              z.writestr('link/through_link.txt', 'SYMLINK-ESCAPE')
+
+          # --- tar: 相对穿越 + 绝对 ---
+          with tarfile.open('/tmp/evil/slip.tar','w') as t:
+              for name, data in [('../../escaped_tar.txt', b'TAR-SLIP-REL'),
+                                 ('/tmp/abs_tar.txt', b'TAR-SLIP-ABS')]:
+                  ti = tarfile.TarInfo(name); ti.size = len(data)
+                  t.addfile(ti, io.BytesIO(data))
+
+          # --- tar: symlink 逃逸 ---
+          with tarfile.open('/tmp/evil/symlink.tar','w') as t:
+              ti = tarfile.TarInfo('lnk'); ti.type = tarfile.SYMTYPE; ti.linkname = '/tmp'
+              t.addfile(ti)
+              data = b'SYMLINK-TAR-ESCAPE'
+              ti2 = tarfile.TarInfo('lnk/through_tar_link.txt'); ti2.size = len(data)
+              t.addfile(ti2, io.BytesIO(data))
+          print("archives built")
+          PY
+          ls -la /tmp/evil
+
+      - name: extract with ditto / unzip / bsdtar / tar
+        run: |
+          set +e
+          rm -rf /tmp/out; mkdir -p /tmp/out
+          rm -f /tmp/escaped_zip.txt /tmp/escaped_tar.txt /tmp/abs_zip.txt /tmp/abs_tar.txt \
+                /tmp/through_link.txt /tmp/through_tar_link.txt
+          echo "=== markers before ==="; ls -la /tmp/escaped_zip.txt /tmp/escaped_tar.txt 2>&1 | head -3
+
+          echo; echo "########## ditto -x -k (Archive Utility 的引擎) ##########"
+          rm -rf /tmp/out/ditto; mkdir -p /tmp/out/ditto
+          ditto -x -k /tmp/evil/slip.zip /tmp/out/ditto; echo "ditto rc=$?"
+          ditto -x -k /tmp/evil/symlink.zip /tmp/out/ditto2; echo "ditto symlink rc=$?"
+
+          echo; echo "########## unzip ##########"
+          rm -rf /tmp/out/unzip; mkdir -p /tmp/out/unzip
+          unzip -o -q /tmp/evil/slip.zip -d /tmp/out/unzip; echo "unzip rc=$?"
+
+          echo; echo "########## bsdtar (zip) ##########"
+          rm -rf /tmp/out/bsdtar; mkdir -p /tmp/out/bsdtar
+          bsdtar -xf /tmp/evil/slip.zip -C /tmp/out/bsdtar; echo "bsdtar zip rc=$?"
+
+          echo; echo "########## tar (tar) ##########"
+          rm -rf /tmp/out/tar; mkdir -p /tmp/out/tar
+          tar -xf /tmp/evil/slip.tar -C /tmp/out/tar; echo "tar rc=$?"
+          rm -rf /tmp/out/tar2; mkdir -p /tmp/out/tar2
+          tar -xf /tmp/evil/symlink.tar -C /tmp/out/tar2; echo "tar symlink rc=$?"
+
+          echo; echo "########## 结果判定 ##########"
+          for f in /tmp/escaped_zip.txt /tmp/escaped_tar.txt /tmp/abs_zip.txt /tmp/abs_tar.txt \
+                   /tmp/through_link.txt /tmp/through_tar_link.txt; do
+            if [ -e "$f" ]; then echo "!!! ESCAPED: $f  content=$(cat "$f" 2>/dev/null | head -c 40)"; else echo "ok  blocked: $f"; fi
+          done
+          echo; echo "--- 目录里实际落了什么 ---"
+          find /tmp/out -type f 2>/dev/null | head -30
+          echo "--- 是否有软链接被创建 ---"
+          find /tmp/out -type l -exec ls -la {} \; 2>/dev/null | head -10
+
+      - name: summary
+        if: always()
+        run: |
+          echo "done"
