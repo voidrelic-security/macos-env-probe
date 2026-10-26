@@ -1,0 +1,134 @@
+name: wcm-trace2
+on:
+  workflow_dispatch:
+
+jobs:
+  trace:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: build poc
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(void) {
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("connected\n"); fflush(stdout);
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_int64(a1, "kClientType", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r = send_sync(c, reg, 3.0);
+              printf("register reply=%d\n", r != NULL);
+              if (r) xpc_release(r);
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m, "kMessageId", 2600);
+              xpc_object_t a = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_int64(a, "kSubId", 0);
+              xpc_dictionary_set_value(m, "kMessageArgs", a);
+              printf("sending 2600\n"); fflush(stdout);
+              xpc_object_t r2 = send_sync(c, m, 6.0);
+              printf("2600 reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: check symbols exist
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          sudo lldb -b -p "$PID" -o "image lookup -rn xpc_dictionary_get_uint64" -o "detach" -o "quit" 2>&1 | tail -15
+          echo "---"
+          sudo lldb -b -p "$PID" -o "image lookup -rn xpc_dictionary_get_value" -o "detach" -o "quit" 2>&1 | tail -10
+          true
+        continue-on-error: true
+
+      - name: trace key lookups with proper breakpoint commands
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          cat > /tmp/w/trace.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_dictionary_get_uint64
+          br s -n xpc_dictionary_get_value
+          br command add 1
+          script import lldb
+          script print("KEY_UINT64:", lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame().FindRegister("x1").GetValue())
+          continue
+          DONE
+          br command add 2
+          script print("KEY_VALUE:", lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame().FindRegister("x1").GetValue())
+          continue
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/trace.lldb > /tmp/w/trace.log 2>&1 ) &
+          LP=$!
+          sleep 10
+          echo "--- poc ---"
+          /tmp/w/poc
+          sleep 12
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          echo "=== trace log KEY lines ==="
+          grep -E "KEY_UINT64|KEY_VALUE" /tmp/w/trace.log | head -50
+          echo
+          echo "=== breakpoint status ==="
+          grep -E "^Breakpoint|where =" /tmp/w/trace.log | head -20
+          true
+        continue-on-error: true
+
+      - name: simple C-string read approach
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          cat > /tmp/w/t2.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_dictionary_get_uint64
+          br command add 1
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 1
+          expression -- (char*)$x1
+          continue
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/t2.lldb > /tmp/w/t2.log 2>&1 ) &
+          LP=$!
+          sleep 10
+          /tmp/w/poc
+          sleep 12
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          echo "=== t2 log ==="
+          cat /tmp/w/t2.log | tail -50
+          true
+        continue-on-error: true
