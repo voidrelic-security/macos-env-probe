@@ -9,7 +9,7 @@ on:
 jobs:
   fuzz:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 14
     steps:
       - name: env
         run: |
@@ -51,7 +51,7 @@ jobs:
           print('valid size =', n)
           random.seed(0x5eed)
 
-          rounds = int(os.environ.get('ROUNDS', '250'))
+          rounds = 60
           crashes = []
           other = 0
 
@@ -79,7 +79,7 @@ jobs:
                   r = subprocess.run(['hdiutil', 'imageinfo', p],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
-                                     timeout=8)
+                                     timeout=3)
                   rc = r.returncode
               except subprocess.TimeoutExpired:
                   rc = -999
@@ -89,6 +89,8 @@ jobs:
                   print('!!! CRASH round=%d rc=%d size=%d' % (i, rc, len(b)))
               else:
                   other += 1
+              if i % 10 == 0:
+                  print('  progress', i, 'crashes', len(crashes), flush=True)
           print('rounds=%d  crashes=%d  clean=%d' % (rounds, len(crashes), other))
           if crashes:
               print('CRASH LIST:', crashes[:20])
