@@ -1,0 +1,59 @@
+name: xar-pkg-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: build evil xar
+        run: |
+          set -x
+          mkdir -p /tmp/xs/src
+          cd /tmp/xs/src
+          echo "XAR-SLIP-REL" > rel.txt
+          echo "XAR-SLIP-ABS" > abs.txt
+          echo "ok" > normal.txt
+          ls -la
+          echo "--- xar --help 摘要 ---"
+          xar --help 2>&1 | head -20 || true
+
+      - name: try creating xar with traversal names
+        run: |
+          set +e
+          cd /tmp/xs/src
+          # 先做一个正常 xar
+          xar -cf /tmp/xs/normal.xar normal.txt; echo "normal xar rc=$?"
+          # 试图用 --directory / 造绝对路径条目
+          xar -cf /tmp/xs/abs.xar -C / rel.txt 2>&1 | head -5; echo "abs xar rc=$?"
+          ls -la /tmp/xs/*.xar
+          echo "--- 列出条目看名字形态 ---"
+          for f in /tmp/xs/*.xar; do echo "== $f"; xar -tf "$f" 2>&1 | head -10; done
+
+      - name: extract with xar and pkgutil
+        run: |
+          set +e
+          rm -rf /tmp/xs/out; mkdir -p /tmp/xs/out
+          rm -f /tmp/rel.txt /tmp/xs/rel.txt
+          echo "########## xar -x ##########"
+          mkdir -p /tmp/xs/out/a && cd /tmp/xs/out/a
+          xar -xf /tmp/xs/normal.xar; echo "xar rc=$?"
+          find /tmp/xs/out/a -type f | head
+          echo
+          echo "########## pkgutil --expand ##########"
+          mkdir -p /tmp/xs/out/b && cd /tmp/xs/out/b
+          pkgutil --expand /tmp/xs/normal.xar /tmp/xs/out/b/exp 2>&1 | head -10; echo "pkgutil rc=$?"
+          find /tmp/xs/out/b -type f 2>/dev/null | head
+          echo
+          echo "########## 判定：有没有写到目标之外 ##########"
+          for f in /tmp/rel.txt /tmp/xs/rel.txt /rel.txt; do
+            if [ -e "$f" ]; then echo "!!! ESCAPED $f"; else echo "ok blocked $f"; fi
+          done
+
+      - name: check xar symlink handling
+        run: |
+          set +e
+          echo "=== xar 版本与 symlink 相关能力 ==="
+          xar --version 2>&1 | head -3
+          man xar 2>/dev/null | col -b | grep -iA2 "symlink\|link" | head -20 || echo "(no man)"
