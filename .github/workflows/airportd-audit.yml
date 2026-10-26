@@ -1,0 +1,103 @@
+name: airportd-audit
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: find method addresses and disassemble
+        run: |
+          set +e
+          mkdir -p /tmp/w
+          PID=$(pgrep -x airportd | head -1)
+          echo "airportd PID=$PID"
+          # 在 arm64e slice 上找关键方法的地址
+          lipo -thin arm64e /usr/libexec/airportd -output /tmp/w/air_arm64e 2>/dev/null
+          otool -tV /tmp/w/air_arm64e 2>/dev/null > /tmp/w/air.asm
+          echo "disasm lines: $(wc -l < /tmp/w/air.asm)"
+          echo
+          echo "=== didUserConfirmRequestType 位置 ==="
+          grep -n "didUserConfirmRequestType" /tmp/w/air.asm | head -5
+          echo
+          echo "=== handleRequest:withData 位置 ==="
+          grep -n "handleRequest.*withData" /tmp/w/air.asm | head -5
+          echo
+          echo "=== didUserConfirm 附近的 audit_token 调用 ==="
+          LINE=$(grep -n "didUserConfirmRequestType" /tmp/w/air.asm | head -1 | cut -d: -f1)
+          if [ -n "$LINE" ]; then
+            sed -n "$((LINE-5)),$((LINE+40))p" /tmp/w/air.asm | head -45
+          fi
+          echo
+          echo "=== 搜 audit_token_to_pid 在哪些函数里被调 ==="
+          grep -n "audit_token_to_pid" /tmp/w/air.asm | head -10
+          true
+        continue-on-error: true
+
+      - name: trace airportd keys (fixed)
+        run: |
+          set +e
+          mkdir -p /tmp/w
+          PID=$(pgrep -x airportd | head -1)
+          echo "airportd PID=$PID"
+          cat > /tmp/w/air_trace.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_dictionary_get_uint64
+          br s -n xpc_dictionary_get_string
+          br s -n xpc_dictionary_get_value
+          br s -n xpc_dictionary_get_int64
+          br s -n xpc_dictionary_get_bool
+          br command add 1
+          printf "U64: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 2
+          printf "STR: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 3
+          printf "VAL: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 4
+          printf "I64: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          br command add 5
+          printf "BOOL: "
+          expression -f c -- (char*)$x1
+          continue
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/air_trace.lldb > /tmp/w/air_trace.log 2>&1 ) &
+          LP=$!
+          sleep 8
+          echo "--- trigger airportd activity ---"
+          # 触发 airportd 的正常操作
+          networksetup -setairportpower en0 on 2>/dev/null
+          sleep 2
+          networksetup -setairportpower en0 off 2>/dev/null
+          sleep 2
+          networksetup -setairportpower en0 on 2>/dev/null
+          sleep 2
+          # 用 airport 命令
+          /System/Library/PrivateFrameworks/Apple80211.framework/Versions/A/Resources/airport -I 2>/dev/null
+          sleep 10
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          sleep 2
+          echo "=== airportd 读取的键名 ==="
+          grep -E "^(U64|STR|VAL|I64|BOOL):" /tmp/w/air_trace.log | sort -u | head -60
+          echo
+          echo "=== 总键名数 ==="
+          grep -cE "^(U64|STR|VAL|I64|BOOL):" /tmp/w/air_trace.log
+          echo
+          echo "=== 原始尾部 ==="
+          grep -E "^(U64|STR|VAL|I64|BOOL):" /tmp/w/air_trace.log | tail -30
+          true
+        continue-on-error: true
