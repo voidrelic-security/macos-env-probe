@@ -1,0 +1,89 @@
+name: entitlement-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: build
+        run: |
+          set -x
+          mkdir -p /tmp/ep
+          cat > /tmp/ep/ep.c <<'CEOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <libproc.h>
+          #include <Security/Security.h>
+          #include <CoreFoundation/CoreFoundation.h>
+
+          static const char *kEnts[] = {
+            "com.apple.private.admin.writeconfig",
+            "com.apple.private.admin.writeconfig.dmapd",
+            "com.apple.private.tcc.manager",
+            "com.apple.private.security.storage.SystemPolicyConfiguration",
+            "com.apple.rootless.install",
+          };
+
+          static void show(SecTaskRef t, const char *n) {
+            CFStringRef k = CFStringCreateWithCString(NULL, n, kCFStringEncodingUTF8);
+            CFTypeRef v = SecTaskCopyValueForEntitlement(t, k, NULL);
+            if (v) {
+              CFStringRef d = CFCopyDescription(v);
+              char b[256] = {0};
+              if (d) { CFStringGetCString(d, b, sizeof b, kCFStringEncodingUTF8); CFRelease(d); }
+              printf("ENT %-58s = %s\n", n, b);
+              CFRelease(v);
+            } else {
+              printf("ENT %-58s = (absent)\n", n);
+            }
+            CFRelease(k);
+          }
+
+          int main(int argc, char **argv) {
+            char buf[4096]; memset(buf, 0, sizeof buf);
+            int n = proc_pidpath(getpid(), buf, sizeof buf);
+            printf("argv0        = %s\n", argv[0]);
+            printf("proc_pidpath = %s\n", n > 0 ? buf : "(failed)");
+            printf("uid/euid     = %d/%d\n", getuid(), geteuid());
+
+            SecTaskRef st = SecTaskCreateFromSelf(NULL);
+            if (!st) { printf("SecTaskCreateFromSelf FAILED\n"); return 2; }
+            for (size_t i = 0; i < sizeof(kEnts)/sizeof(kEnts[0]); i++) show(st, kEnts[i]);
+            CFRelease(st);
+            printf("PROBE-SURVIVED\n");
+            return 0;
+          }
+          CEOF
+          clang -O0 -o /tmp/ep/ep /tmp/ep/ep.c -framework Security -framework Foundation
+          cat > /tmp/ep/ent.plist <<'PEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.private.admin.writeconfig</key><true/>
+            <key>com.apple.private.admin.writeconfig.dmapd</key><true/>
+            <key>com.apple.private.tcc.manager</key><true/>
+          </dict></plist>
+          PEOF
+          codesign -s - --entitlements /tmp/ep/ent.plist --force /tmp/ep/ep
+          echo "--- signed entitlements ---"
+          codesign -d --entitlements - /tmp/ep/ep 2>&1 | head -40
+
+      - name: run ad-hoc signed with private entitlements
+        run: |
+          set +e
+          /tmp/ep/ep
+          rc=$?
+          echo "EXIT=$rc"
+          if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            echo ">>> SIGNAL: process was killed (137=SIGKILL, 139=SIGSEGV) -- AMFI likely blocked it"
+          fi
+
+      - name: check amfi log
+        if: always()
+        run: |
+          set +e
+          echo "--- recent AMFI/amfid messages ---"
+          log show --last 3m --predicate 'process == "amfid" OR eventMessage CONTAINS "AMFI"' 2>/dev/null | tail -30
