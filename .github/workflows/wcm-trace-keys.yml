@@ -1,0 +1,105 @@
+name: wcm-trace-keys
+on:
+  workflow_dispatch:
+
+jobs: 
+  trace:
+    runs-on: macos-15
+    timeout-minutes: 14
+    steps:
+      - name: build poc
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(void) {
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("S1 create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r2 = send_sync(c, reg, 3.0);
+              printf("S2 register_reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+              xpc_object_t m4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m4, "kMessageId", 2600);
+              xpc_object_t a4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_int64(a4, "kSubId", 0);
+              xpc_dictionary_set_int64(a4, "probe", 1);
+              xpc_dictionary_set_value(m4, "kMessageArgs", a4);
+              xpc_object_t r4 = send_sync(c, m4, 6.0);
+              printf("S4 msg2600_reply=%d\n", r4 != NULL);
+              if (r4) xpc_release(r4);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: trace dictionary key lookups
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "PID=$PID"
+          cat > /tmp/w/trace.lldb <<'LDB'
+          br s -n xpc_dictionary_get_uint64
+          br s -n xpc_dictionary_get_int64
+          br s -n xpc_dictionary_get_string
+          br s -n xpc_dictionary_get_value
+          br s -n xpc_array_get_count
+          br command add 1 -o "printf \"[get_uint64] key=%s\n\", (char*)$x1" -o "continue"
+          br command add 2 -o "printf \"[get_int64] key=%s\n\", (char*)$x1" -o "continue"
+          br command add 3 -o "printf \"[get_string] key=%s\n\", (char*)$x1" -o "continue"
+          br command add 4 -o "printf \"[get_value] key=%s\n\", (char*)$x1" -o "continue"
+          br command add 5 -o "printf \"[array_get_count]\n\"" -o "continue"
+          continue
+          LDB
+          ( sudo lldb -b -p "$PID" -s /tmp/w/trace.lldb > /tmp/w/trace.log 2>&1 ) &
+          LP=$!
+          sleep 8
+          echo "--- poc ---"
+          /tmp/w/poc
+          sleep 15
+          kill $LP 2>/dev/null; pkill -f "lldb -b -p" 2>/dev/null
+          echo "=== 抓到的键名（去重）==="
+          grep -oE '\[(get_uint64|get_int64|get_string|get_value)\] key=[^ ]*' /tmp/w/trace.log | sort -u | head -60
+          echo
+          echo "=== 命中统计 ==="
+          grep -cE '^\[get_' /tmp/w/trace.log
+          echo
+          echo "=== 原始尾部 ==="
+          grep -E '^\[get_' /tmp/w/trace.log | tail -40
+          true
+        continue-on-error: true
+
+      - name: also dump strings the daemon compares
+        run: |
+          set +e
+          echo "=== 二进制里所有 kMessageId 相关的键名 ==="
+          strings -a /usr/sbin/WirelessRadioManagerd | grep -E "^k[A-Z]" | sort -u | head -60
+          echo
+          echo "=== 含 2600 / MessageId 的字符串 ==="
+          strings -a /usr/sbin/WirelessRadioManagerd | grep -iE "messageid|2600|coex" | sort -u | head -30
+          true
+        continue-on-error: true
