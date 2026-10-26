@@ -1,0 +1,138 @@
+name: dmg-fuzz2
+on:
+  workflow_dispatch:
+
+jobs: 
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: build valid dmg
+        run: |
+          set -x
+          mkdir -p /tmp/d && cd /tmp/d
+          hdiutil create -size 2m -fs HFS+ -volname T -ov /tmp/d/raw.dmg >/dev/null
+          hdiutil convert /tmp/d/raw.dmg -format UDZO -o /tmp/d/valid.dmg >/dev/null
+          ls -la /tmp/d/valid.dmg
+
+      - name: checksum-aware fuzz
+        run: |
+          set +e
+          python3 - <<'PY'
+          import os, random, struct, subprocess, shutil, zlib
+
+          V = '/tmp/d/valid.dmg'
+          data = open(V, 'rb').read()
+          n = len(data)
+          T = 512                      # UDIF trailer size
+          base = n - T
+          tr = data[base:]
+          assert tr[:4] == b'koly', 'no koly trailer'
+          print('size=%d trailer@%d magic=ok' % (n, base))
+
+          # --- 自校准：找出 trailer 自校验的 CRC 字段位置与覆盖范围 ---
+          def crc32(b): return zlib.crc32(b) & 0xffffffff
+          found = None
+          # 常见布局：校验字段在 0x1F8（type）、0x1FC（size）、0x200 之后是 128B 校验值
+          # 但 trailer 只有 512B，所以校验值在 0x200 之外 => 实际是 0x1F8 处 type/size，
+          # 校验值放在 0x200 之前？逐个候选试。
+          cands = []
+          for ck_off in range(0x100, 0x200, 4):
+              for cover_end in (ck_off, 0x1F8, 0x200):
+                  for zero_span in (4, 8, 0x80, 0x88):
+                      blob = bytearray(tr)
+                      stored = struct.unpack_from('<I', tr, ck_off)[0]
+                      # 把候选校验区清零后算
+                      for i in range(ck_off, min(ck_off + zero_span, T)):
+                          blob[i] = 0
+                      if crc32(bytes(blob[:cover_end])) == stored and stored != 0:
+                          cands.append((ck_off, cover_end, zero_span, stored))
+          print('self-check candidates:', cands[:6], 'count=', len(cands))
+          if not cands:
+              print('NO SELF-CHECK FOUND -- 说明 trailer 自校验不是简单 CRC32 或字段布局不同')
+              # 退化：只变异 XML 区域（在 trailer 之前，不受 trailer 校验保护）
+              cands = []
+
+          ck_off, cover_end, zero_span, _ = cands[0] if cands else (None, None, None, None)
+          if ck_off is not None:
+              print('using checksum field @0x%x, covers [0,%d), zero span %d' % (ck_off, cover_end, zero_span))
+
+          # --- 变异目标：trailer 里的关键 32/64 位字段 + XML/BLKX 区域 ---
+          def fix_trailer(b):
+              if ck_off is None: return b
+              blob = bytearray(b[base:base+T])
+              for i in range(ck_off, min(ck_off + zero_span, T)):
+                  blob[i] = 0
+              c = crc32(bytes(blob[:cover_end]))
+              struct.pack_into('<I', blob, ck_off, c)
+              out = bytearray(b); out[base:base+T] = blob
+              return bytes(out)
+
+          xml_off, xml_len = struct.unpack_from('<QQ', tr, 0xD8)
+          print('xml offset=%d len=%d' % (xml_off, xml_len))
+          data_fork_len = struct.unpack_from('<Q', tr, 0x20)[0]
+          print('dataForkLength=%d sectorCount=%d' % (data_fork_len, struct.unpack_from('<Q', tr, 0x1EC)[0]))
+
+          random.seed(0xC0FFEE)
+          rounds = 120
+          crashes = []
+          hangs = 0
+
+          for i in range(rounds):
+              b = bytearray(data)
+              mode = random.random()
+              if mode < 0.5 and ck_off is not None:
+                  # 改 trailer 字段（8/16/32/64 位边界对齐）
+                  for _ in range(random.choice([1,1,2,3])):
+                      off = random.randrange(0, 0x1F8, 4)
+                      if random.random() < 0.5:
+                          struct.pack_into('<I', b, base + off, random.randrange(0, 1<<32))
+                      else:
+                          struct.pack_into('<Q', b, base + (off & ~7), random.randrange(0, 1<<40))
+              elif mode < 0.85 and xml_len and xml_off + xml_len <= n:
+                  # 改 XML/BLKX 区域
+                  for _ in range(random.choice([1,2,4])):
+                      off = xml_off + random.randrange(0, xml_len)
+                      b[off] = random.randrange(0, 256)
+              else:
+                  # 改数据区
+                  for _ in range(random.choice([1,4,16])):
+                      off = random.randrange(0, max(1, base))
+                      b[off] = random.randrange(0, 256)
+
+              b = fix_trailer(bytes(b))
+              p = '/tmp/d/mut.dmg'
+              open(p, 'wb').write(b)
+              try:
+                  r = subprocess.run(['hdiutil', 'imageinfo', p],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     timeout=4)
+                  rc = r.returncode
+              except subprocess.TimeoutExpired:
+                  rc = -999; hangs += 1
+              if rc < 0 or rc >= 128:
+                  crashes.append((i, rc, len(b)))
+                  shutil.copy(p, '/tmp/d/crash_%d_rc%d.dmg' % (i, rc))
+                  print('!!! CRASH round=%d rc=%d size=%d' % (i, rc, len(b)), flush=True)
+              if i % 20 == 0:
+                  print('  progress', i, 'crashes', len(crashes), 'hangs', hangs, flush=True)
+
+          print('rounds=%d crashes=%d hangs=%d' % (rounds, len(crashes), hangs))
+          if crashes: print('CRASH LIST:', crashes[:20])
+          PY
+
+      - name: triage
+        if: always()
+        run: |
+          set +e
+          ls -la /tmp/d/crash_*.dmg 2>/dev/null
+          ls -lat ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -8
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-crashes2
+          path: /tmp/d/crash_*.dmg
+          if-no-files-found: ignore
+          retention-days: 3
