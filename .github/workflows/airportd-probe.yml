@@ -1,0 +1,70 @@
+name: airportd-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: recon airportd
+        run: |
+          set +e
+          echo "=== airportd 进程 ==="
+          pgrep -la airportd
+          echo "=== airportd 二进制 ==="
+          ls -la /usr/libexec/airportd
+          file /usr/libexec/airportd
+          codesign -dv /usr/libexec/airportd 2>&1 | head -8
+          echo "=== entitlements ==="
+          codesign -d --entitlements - /usr/libexec/airportd 2>&1 | head -30
+          echo "=== 那条 MISSING ENTITLEMENT 日志的来源 ==="
+          strings -a /usr/libexec/airportd | grep -i "MISSING ENTITLEMENT" | head -5
+          echo "=== airportd 的 MachServices ==="
+          sudo launchctl print system/com.apple.airportd 2>&1 | grep -A5 "mach" | head -15
+          echo "=== 大小 ==="
+          wc -c /usr/libexec/airportd
+          echo "=== import 符号中与 XPC / 校验相关的 ==="
+          otool -Iv /usr/libexec/airportd 2>/dev/null | grep -iE "SecTask|SecCode|entitle|audit|xpc_connection_get" | head -20
+          echo "=== ObjC 方法表中带 policy/allow/auth 的 ==="
+          otool -oV /usr/libexec/airportd 2>/dev/null | grep -iE "allow|policy|auth|entitle|accept|validate|verify" | head -20
+          true
+        continue-on-error: true
+
+      - name: test airportd XPC reachability
+        run: |
+          set +e
+          mkdir -p /tmp/w
+          cat > /tmp/w/air.c <<'EOF'
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          int main(int argc, char **argv) {
+              const char *svc = argv[1];
+              xpc_connection_t c = xpc_connection_create_mach_service(svc,
+                  dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), 0);
+              if (!c) { printf("%s create=0\n", svc); return 1; }
+              xpc_connection_set_event_handler(c, ^(xpc_object_t e) { (void)e; });
+              xpc_connection_resume(c);
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_uint64(m, "type", 1);
+              xpc_dictionary_set_string(m, "probe", "hello");
+              xpc_object_t r = xpc_connection_send_message_with_reply_sync(c, m);
+              if (r == XPC_ERROR_CONNECTION_INVALID)
+                  printf("%s CONNECTION_INVALID\n", svc);
+              else if (r)
+                  printf("%s GOT_REPLY type=%s\n", svc, xpc_type_get_name(xpc_get_type(r)));
+              else
+                  printf("%s NULL_REPLY\n", svc);
+              xpc_connection_cancel(c);
+              return 0;
+          }
+          EOF
+          clang -fblocks -O0 -o /tmp/w/air /tmp/w/air.c -framework Foundation
+          echo "=== 尝试连接 airportd 的各种 mach service 名 ==="
+          for svc in com.apple.airportd com.apple.airport.agent com.apple.wifi.manager; do
+              /tmp/w/air "$svc"
+          done
+          true
+        continue-on-error: true
