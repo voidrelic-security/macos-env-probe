@@ -1,0 +1,125 @@
+name: tccd-attrib-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, macos-13]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 12
+    steps:
+      - name: probe com.apple.tccd.system
+        run: |
+          set +e
+          echo "runner=${{ matrix.os }} macOS=$(sw_vers -productVersion)"
+          mkdir -p /tmp/tp
+          cat > /tmp/tp/p.c <<'CEOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <string.h>
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+
+          // libsystem_responsibility（<responsibility.h>，SDK 未公开头，手工声明）
+          extern int responsibility_get_pid_responsible_for_pid(pid_t pid);
+          extern int responsibility_set_pid_responsible_for_pid(pid_t pid, pid_t responsible_pid);
+
+          static const char *SVC = "com.apple.tccd.system";
+
+          // 每条消息一条新连接，避免互相污染
+          static xpc_object_t send(const char *msgid, xpc_object_t (*fill)(xpc_object_t), int timeout_s) {
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC, NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
+              __block xpc_object_t reply = NULL;
+              __block int done = 0;
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {
+                  if (xpc_get_type(ev) == XPC_TYPE_ERROR) {
+                      const char *d = xpc_dictionary_get_string(ev, XPC_ERROR_KEY_DESCRIPTION);
+                      printf("    [event] ERROR: %s\n", d ? d : "?");
+                      done = 1; dispatch_semaphore_signal(sem); return;
+                  }
+                  reply = xpc_retain(ev);
+                  done = 1; dispatch_semaphore_signal(sem);
+              });
+              xpc_connection_resume(c);
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_string(m, "TCCD_MSG_ID", msgid);
+              if (fill) fill(m);
+              xpc_connection_send_message_with_reply(c, m, dispatch_get_global_queue(0,0), ^(xpc_object_t r) {
+                  if (xpc_get_type(r) == XPC_TYPE_ERROR) {
+                      const char *d = xpc_dictionary_get_string(r, XPC_ERROR_KEY_DESCRIPTION);
+                      printf("    [reply] ERROR: %s\n", d ? d : "?");
+                  } else { reply = xpc_retain(r); }
+                  done = 1; dispatch_semaphore_signal(sem);
+              });
+              dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_s*NSEC_PER_SEC));
+              if (!done) printf("    [reply] TIMEOUT(%ds)\n", timeout_s);
+              xpc_release(m);
+              xpc_connection_cancel(c);
+              return reply;
+          }
+
+          static xpc_object_t fill_check(xpc_object_t m) {
+              xpc_dictionary_set_string(m, "dbPath", "/var/db/com.apple.TCC/TCC.db");
+              return m;
+          }
+          static xpc_object_t fill_register(xpc_object_t m) {
+              char buf[128]; snprintf(buf, sizeof buf, "/tmp/tccd_probe_%d.db", getpid());
+              xpc_dictionary_set_string(m, "dbPath", buf);
+              return m;
+          }
+          static pid_t g_target = 0;
+          static xpc_object_t fill_setresp(xpc_object_t m) {
+              xpc_dictionary_set_int64(m, "pid", getpid());
+              xpc_dictionary_set_int64(m, "responsible_pid", g_target);
+              return m;
+          }
+
+          int main(void) {
+            printf("uid=%d euid=%d pid=%d\n", getuid(), geteuid(), getpid());
+            printf("self responsible_pid (before) = %d\n", responsibility_get_pid_responsible_for_pid(getpid()));
+
+            printf("\n[1] TCCCheckIfDatabaseIsRegistered (read-only)\n");
+            xpc_object_t r1 = send("TCCCheckIfDatabaseIsRegistered", fill_check, 4);
+            if (r1) { printf("    result=%d\n", (int)xpc_dictionary_get_bool(r1, "result")); xpc_release(r1); }
+
+            printf("\n[2] TCCRegisterNewDatabase (/tmp/tccd_probe_<pid>.db)\n");
+            xpc_object_t r2 = send("TCCRegisterNewDatabase", fill_register, 4);
+            if (r2) { printf("    result=%d\n", (int)xpc_dictionary_get_bool(r2, "result")); xpc_release(r2); }
+
+            printf("\n[3] TCCAccessSetPidResponsibleForPid (self -> 1 / launchd)\n");
+            g_target = 1;
+            xpc_object_t r3 = send("TCCAccessSetPidResponsibleForPid", fill_setresp, 4);
+            if (r3) { printf("    result=%d\n", (int)xpc_dictionary_get_bool(r3, "result")); xpc_release(r3); }
+            printf("    self responsible_pid (after set->1) = %d\n", responsibility_get_pid_responsible_for_pid(getpid()));
+
+            printf("\n[4] restore: self -> 0\n");
+            g_target = 0;
+            xpc_object_t r4 = send("TCCAccessSetPidResponsibleForPid", fill_setresp, 4);
+            if (r4) { printf("    result=%d\n", (int)xpc_dictionary_get_bool(r4, "result")); xpc_release(r4); }
+            printf("    self responsible_pid (after restore) = %d\n", responsibility_get_pid_responsible_for_pid(getpid()));
+
+            printf("\n== done ==\n");
+            return 0;
+          }
+          CEOF
+          clang -fblocks -framework Foundation -lxpc -o /tmp/tp/p /tmp/tp/p.c 2>&1 | tail -15
+          ls -la /tmp/tp/p 2>/dev/null
+          codesign -s - /tmp/tp/p 2>&1
+          echo "--- run ---"
+          /tmp/tp/p 2>&1
+          echo "--- rc=$? ---"
+
+      - name: context
+        run: |
+          set +e
+          echo "=== launchctl print system/com.apple.tccd ==="
+          sudo launchctl print system/com.apple.tccd 2>&1 | head -20
+          echo "=== tccd.system plist ==="
+          plutil -p /System/Library/LaunchDaemons/com.apple.tccd.system.plist 2>&1 | head -30
+          echo "=== who is pid 1 ==="
+          ps -p 1 -o pid,comm 2>&1
