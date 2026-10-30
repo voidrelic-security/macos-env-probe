@@ -1,0 +1,45 @@
+name: resp-disasm
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, macos-13]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: disassemble responsibility_set_pid_responsible_for_pid via lldb
+        run: |
+          set +e
+          echo "runner=${{ matrix.os }} macOS=$(sw_vers -productVersion) arch=$(uname -m)"
+          echo "=== 找 tccd pid ==="
+          ps -Ao pid,comm | grep -i tccd | head -5
+          PID=$(ps -Ao pid,comm | grep -i 'tccd' | grep -v grep | head -1 | awk '{print $1}')
+          echo "target pid=$PID"
+          if [ -z "$PID" ]; then echo "no tccd running"; exit 0; fi
+
+          echo "=== lldb: 定位符号并反汇编 ==="
+          sudo lldb -b \
+            -o "process attach --pid $PID" \
+            -o "image lookup -n responsibility_set_pid_responsible_for_pid" \
+            -o "image lookup -n responsibility_get_pid_responsible_for_pid" \
+            -o "disassemble -n responsibility_set_pid_responsible_for_pid" \
+            -o "detach" \
+            -o "quit" 2>&1 | head -120
+
+      - name: also try dyld_info / nm on the dylib
+        run: |
+          set +e
+          echo "=== libquarantine 位置 ==="
+          ls -la /usr/lib/libquarantine.dylib 2>&1
+          echo "=== nm -m 找符号（若可读）==="
+          nm -m /usr/lib/libquarantine.dylib 2>&1 | grep -i responsibility | head -20
+          echo "=== dyld_info ==="
+          dyld_info -exports /usr/lib/libquarantine.dylib 2>&1 | grep -i responsibility | head -20
+          echo "=== 从 DSC 抽（若工具在）==="
+          which dyld_shared_cache_util 2>&1
+          ls /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/ 2>&1 | head -5
