@@ -1,0 +1,152 @@
+name: sp-xpc-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: build and run ExecManager probe
+        run: |
+          set +e
+          mkdir -p /tmp/p
+          cat > /tmp/p/probe.m <<'OBJCEOF'
+          #import <Foundation/Foundation.h>
+          #import <Security/Security.h>
+
+          @protocol ExecProbe
+          - (void)isDeveloperModeEnabledWithReply:(void(^)(BOOL))r;
+          - (void)setDeveloperModeEnabled:(BOOL)e withReply:(void(^)(BOOL))r;
+          - (void)getGatekeeperPolicyWithReply:(void(^)(id))r;
+          - (void)isGatekeeperPolicyAllowed:(unsigned long long)v withReply:(void(^)(id))r;
+          - (void)allowGatekeeperPolicy:(unsigned long long)v withReply:(void(^)(id))r;
+          - (void)urlHasGatekeeperException:(id)u withReply:(void(^)(id))r;
+          - (void)addGatekeeperUserIntent:(id)u withReply:(void(^)(id))r;
+          - (void)addExceptionForURL:(id)u withReply:(void(^)(id))r;
+          - (void)isBlockedSoftware:(id)u withReply:(void(^)(id))r;
+          - (void)requestDeveloperToolAccessWithReply:(void(^)(id))r;
+          - (void)isDeveloperToolEnvironmentWithReply:(void(^)(id))r;
+          - (void)copyBlockedExecutionPolicyItemsWithReply:(void(^)(id))r;
+          - (void)getFastGatekeeperOverrideModeEnabledWithReply:(void(^)(id))r;
+          @end
+
+          static NSString *gSvc = @"com.apple.security.syspolicy.exec";
+
+          // 每个方法一条全新连接：一个方法把连接打废不会污染其他方法
+          static void runOne(NSString *label, void (^invoke)(id<ExecProbe>, dispatch_semaphore_t)) {
+              NSXPCConnection *c = [[NSXPCConnection alloc] initWithMachServiceName:gSvc
+                                        options:NSXPCConnectionPrivileged];
+              c.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(ExecProbe)];
+              __block NSString *outcome = @"<no reply>";
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              c.invalidationHandler = ^{
+                  outcome = @"CONNECTION_INVALIDATED";
+                  dispatch_semaphore_signal(sem);
+              };
+              c.interruptionHandler = ^{
+                  outcome = @"CONNECTION_INTERRUPTED";
+                  dispatch_semaphore_signal(sem);
+              };
+              [c resume];
+              id<ExecProbe> proxy = [c remoteObjectProxyWithErrorHandler:^(NSError *e) {
+                  outcome = [NSString stringWithFormat:@"XPC_ERROR domain=%@ code=%ld desc=%@",
+                             e.domain, (long)e.code, e.localizedDescription];
+                  dispatch_semaphore_signal(sem);
+              }];
+              invoke(proxy, sem);
+              long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 4ull*NSEC_PER_SEC));
+              if (r != 0) outcome = @"TIMEOUT(4s)";
+              printf("%-46s %s\n", [label UTF8String], [outcome UTF8String]);
+              fflush(stdout);
+              [c invalidate];
+          }
+
+          int main(void) {
+              @autoreleasepool {
+                  printf("== process ==\n");
+                  printf("uid=%d euid=%d pid=%d\n", getuid(), geteuid(), getpid());
+                  printf("binary=%s\n", [[[NSBundle mainBundle] executablePath] UTF8String]);
+                  SecTaskRef t = SecTaskCreateFromSelf(NULL);
+                  NSDictionary *ents = t ? (__bridge_transfer NSDictionary *)SecTaskCopyValueForEntitlement(t, CFSTR("com.apple.private.security.syspolicy.package-installation"), NULL) : nil;
+                  printf("has_package_installation_entitlement=%s\n", ents ? "YES" : "NO");
+                  printf("\n== ExecManager calls as an unentitled process ==\n");
+
+                  runOne(@"isDeveloperModeEnabledWithReply:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p isDeveloperModeEnabledWithReply:^(BOOL v){ printf("   reply BOOL=%d\n", v); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"getGatekeeperPolicyWithReply:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p getGatekeeperPolicyWithReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"isGatekeeperPolicyAllowed(0):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p isGatekeeperPolicyAllowed:0 withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"getFastGatekeeperOverrideModeEnabled:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p getFastGatekeeperOverrideModeEnabledWithReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"copyBlockedExecutionPolicyItems:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p copyBlockedExecutionPolicyItemsWithReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"isDeveloperToolEnvironment:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p isDeveloperToolEnvironmentWithReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"urlHasGatekeeperException(/bin/sh):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p urlHasGatekeeperException:[NSURL fileURLWithPath:@"/bin/sh"] withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"isBlockedSoftware(/bin/sh):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p isBlockedSoftware:[NSURL fileURLWithPath:@"/bin/sh"] withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  // 只读 getter：写一次 false 再写回原值，避免改变系统状态
+                  runOne(@"setDeveloperModeEnabled(false):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p setDeveloperModeEnabled:NO withReply:^(BOOL v){ printf("   reply BOOL=%d\n", v); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"addGatekeeperUserIntent(/bin/sh):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p addGatekeeperUserIntent:[NSURL fileURLWithPath:@"/bin/sh"] withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"allowGatekeeperPolicy(0):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p allowGatekeeperPolicy:0 withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  // 带私有 entitlement 的对照：应当被拒
+                  runOne(@"CONTROL addExceptionForURL(/bin/sh):", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p addExceptionForURL:[NSURL fileURLWithPath:@"/bin/sh"] withReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  runOne(@"requestDeveloperToolAccess:", ^(id<ExecProbe> p, dispatch_semaphore_t s){
+                      [p requestDeveloperToolAccessWithReply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  printf("\n== done ==\n");
+              }
+              return 0;
+          }
+          OBJCEOF
+          clang -fobjc-arc -framework Foundation -framework Security -o /tmp/p/probe /tmp/p/probe.m 2>&1 | tail -20
+          ls -la /tmp/p/probe
+          echo "--- codesign (ad-hoc, no entitlements) ---"
+          codesign -s - /tmp/p/probe 2>&1
+          codesign -d --entitlements - /tmp/p/probe 2>&1 | head -5
+          echo "--- run ---"
+          /tmp/p/probe 2>&1
+          echo "--- exit=$? ---"
+
+      - name: control - connection to a service that should reject
+        run: |
+          set +e
+          cat > /tmp/p/ctl.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          int main(void){ @autoreleasepool {
+            const char *svcs[] = {"com.apple.security.syspolicy.exec","com.apple.security.syspolicy.measure","com.apple.security.syspolicy.report","com.apple.security.syspolicy.kext"};
+            for (int i=0;i<4;i++){
+              NSXPCConnection *c=[[NSXPCConnection alloc] initWithMachServiceName:[NSString stringWithUTF8String:svcs[i]] options:NSXPCConnectionPrivileged];
+              __block NSString *o=@"<resumed, no invalidation within 2s>";
+              dispatch_semaphore_t s=dispatch_semaphore_create(0);
+              c.invalidationHandler=^{o=@"INVALIDATED";dispatch_semaphore_signal(s);};
+              [c resume];
+              dispatch_semaphore_wait(s, dispatch_time(DISPATCH_NOW, 2ull*NSEC_PER_SEC));
+              printf("%-44s %s\n", svcs[i], [o UTF8String]);
+              [c invalidate];
+            }
+          } return 0; }
+          EOF
+          clang -fobjc-arc -framework Foundation -o /tmp/p/ctl /tmp/p/ctl.m 2>&1 | tail -10
+          codesign -s - /tmp/p/ctl 2>&1
+          /tmp/p/ctl 2>&1
