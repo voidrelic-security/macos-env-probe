@@ -1,0 +1,66 @@
+name: airportd-extract
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - name: extract airportd + disassemble auditToken methods
+        run: |
+          set +e
+          mkdir -p /tmp/ap
+          B=/usr/libexec/airportd
+          echo "=== basic ==="
+          file "$B"
+          ls -la "$B"
+          shasum -a 256 "$B"
+          echo "=== arch ==="
+          lipo -info "$B"
+          lipo -thin arm64e "$B" -output /tmp/ap/airportd.arm64e 2>/dev/null || cp "$B" /tmp/ap/airportd.arm64e
+          ls -la /tmp/ap/airportd.arm64e
+
+          echo "=== otool text/imports ==="
+          otool -tV /tmp/ap/airportd.arm64e > /tmp/ap/text.asm 2>/dev/null
+          wc -l /tmp/ap/text.asm
+          otool -Iv /tmp/ap/airportd.arm64e > /tmp/ap/imports.txt 2>/dev/null
+          wc -l /tmp/ap/imports.txt
+
+          echo "=== imports of interest ==="
+          grep -iE 'audit_token|proc_pidpath|xpc_dictionary|xpc_array|xpc_connection|SecTask|SecCode|CWFXPC' /tmp/ap/imports.txt | head -60
+
+          echo "=== all selectors containing auditToken / confirm / entitlement ==="
+          strings -a /tmp/ap/airportd.arm64e | grep -E 'auditToken|didUserConfirm|Entitlement|entitlement' | sort -u | head -60
+
+          echo "=== lldb: locate the method symbols ==="
+          lldb -b \
+            -o "target create /tmp/ap/airportd.arm64e" \
+            -o "image lookup -rn didUserConfirmRequestType" \
+            -o "image lookup -rn proc_pidpath_audittoken" \
+            -o "image lookup -rn audit_token_to_pid" \
+            -o "exit" 2>&1 | head -80
+
+          echo "=== lldb: disassemble didUserConfirmRequestType:auditToken: ==="
+          lldb -b \
+            -o "target create /tmp/ap/airportd.arm64e" \
+            -o "disassemble -n '-[CWFXPCRequestProxy didUserConfirmRequestType:auditToken:]'" \
+            -o "exit" 2>&1 | head -120
+
+          echo "=== objc metadata: method list entries mentioning the selector ==="
+          otool -oV /tmp/ap/airportd.arm64e > /tmp/ap/objc.txt 2>/dev/null
+          wc -l /tmp/ap/objc.txt
+          grep -n -B3 -A8 'didUserConfirmRequestType' /tmp/ap/objc.txt | head -60
+
+          echo "=== xpc dictionary key strings (candidate message keys) ==="
+          strings -a /tmp/ap/airportd.arm64e | grep -E '^[A-Z][A-Za-z0-9]{2,40}$' | sort -u | head -200
+
+          tar czf /tmp/ap.tar.gz -C /tmp/ap airportd.arm64e text.asm imports.txt objc.txt
+          ls -la /tmp/ap.tar.gz
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airportd-bin
+          path: /tmp/ap.tar.gz
+          retention-days: 3
