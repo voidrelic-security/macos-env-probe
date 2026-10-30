@@ -1,0 +1,115 @@
+name: logind-reach
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: probe com.apple.logind as an unentitled process
+        run: |
+          set +e
+          mkdir -p /tmp/lp
+          cat > /tmp/lp/probe.m <<'OBJCEOF'
+          #import <Foundation/Foundation.h>
+          #import <Security/Security.h>
+
+          // 只声明只读方法，签名取自 LFLogindListenerInterface 的 __objc_methtype：
+          //   SMGetAllSessions:            v24@0:8@?16
+          //   SMGetCurrentSessionID:       v24@0:8@?16
+          //   SMIsThisSessionOnConsole:    v24@0:8@?16
+          //   SACopyAutologinPassword:     v24@0:8@?16
+          //   SMGetSessionProperties:reply: v28@0:8i16@?20
+          @protocol LFLogindProbe
+          - (void)SMGetAllSessions:(void(^)(id))r;
+          - (void)SMGetCurrentSessionID:(void(^)(id))r;
+          - (void)SMIsThisSessionOnConsole:(void(^)(id))r;
+          - (void)SACopyAutologinPassword:(void(^)(id))r;
+          - (void)SMGetSessionProperties:(int)sid reply:(void(^)(id))r;
+          @end
+
+          static NSString *gSvc = @"com.apple.logind";
+
+          // 1) 先只测「连接是否被接受」：对端校验若失败，shouldAcceptNewConnection
+          //    会立刻 invalidate，2 秒内必然收到 invalidationHandler。
+          static void connectionOnly(NSString *svc) {
+              NSXPCConnection *c = [[NSXPCConnection alloc] initWithMachServiceName:svc
+                                        options:NSXPCConnectionPrivileged];
+              c.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(LFLogindProbe)];
+              __block NSString *o = @"ALIVE_2S (accepted, no invalidation)";
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              c.invalidationHandler = ^{ o = @"INVALIDATED"; dispatch_semaphore_signal(sem); };
+              c.interruptionHandler = ^{ o = @"INTERRUPTED"; dispatch_semaphore_signal(sem); };
+              [c resume];
+              dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 2ull*NSEC_PER_SEC));
+              printf("%-42s %s\n", [svc UTF8String], [o UTF8String]);
+              fflush(stdout);
+              [c invalidate];
+          }
+
+          // 2) 连接被接受后再打一发只读方法，确认能拿到回复
+          static void callOne(NSString *label, void (^invoke)(id<LFLogindProbe>, dispatch_semaphore_t)) {
+              NSXPCConnection *c = [[NSXPCConnection alloc] initWithMachServiceName:gSvc
+                                        options:NSXPCConnectionPrivileged];
+              c.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(LFLogindProbe)];
+              __block NSString *o = @"<no reply>";
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              c.invalidationHandler = ^{ o = @"CONNECTION_INVALIDATED"; dispatch_semaphore_signal(sem); };
+              [c resume];
+              id<LFLogindProbe> p = [c remoteObjectProxyWithErrorHandler:^(NSError *e) {
+                  o = [NSString stringWithFormat:@"XPC_ERROR %@/%ld %@", e.domain, (long)e.code, e.localizedDescription];
+                  dispatch_semaphore_signal(sem);
+              }];
+              invoke(p, sem);
+              long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 4ull*NSEC_PER_SEC));
+              if (r != 0) o = @"TIMEOUT(4s)";
+              printf("%-42s %s\n", [label UTF8String], [o UTF8String]);
+              fflush(stdout);
+              [c invalidate];
+          }
+
+          int main(void) {
+              @autoreleasepool {
+                  printf("== process ==\n");
+                  printf("uid=%d euid=%d pid=%d\n", getuid(), geteuid(), getpid());
+                  printf("== connection acceptance ==\n");
+                  connectionOnly(@"com.apple.logind");
+                  connectionOnly(@"com.apple.security.syspolicy.exec");   // 已知开放连接的对照
+                  printf("\n== read-only calls on com.apple.logind ==\n");
+                  callOne(@"SMGetCurrentSessionID:", ^(id<LFLogindProbe> p, dispatch_semaphore_t s){
+                      [p SMGetCurrentSessionID:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  callOne(@"SMGetAllSessions:", ^(id<LFLogindProbe> p, dispatch_semaphore_t s){
+                      [p SMGetAllSessions:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  callOne(@"SMIsThisSessionOnConsole:", ^(id<LFLogindProbe> p, dispatch_semaphore_t s){
+                      [p SMIsThisSessionOnConsole:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  callOne(@"SACopyAutologinPassword:", ^(id<LFLogindProbe> p, dispatch_semaphore_t s){
+                      [p SACopyAutologinPassword:^(id v){ printf("   reply len=%lu\n", (unsigned long)[[v description] length]); dispatch_semaphore_signal(s); }];
+                  });
+                  callOne(@"SMGetSessionProperties(0):", ^(id<LFLogindProbe> p, dispatch_semaphore_t s){
+                      [p SMGetSessionProperties:0 reply:^(id v){ printf("   reply %s\n", [[v description] UTF8String]); dispatch_semaphore_signal(s); }];
+                  });
+                  printf("\n== done ==\n");
+              }
+              return 0;
+          }
+          OBJCEOF
+          clang -fobjc-arc -framework Foundation -framework Security -o /tmp/lp/probe /tmp/lp/probe.m 2>&1 | tail -15
+          ls -la /tmp/lp/probe
+          codesign -s - /tmp/lp/probe 2>&1
+          echo "--- run ---"
+          /tmp/lp/probe 2>&1
+          echo "--- done ---"
+
+      - name: control - what the service registration looks like
+        run: |
+          set +e
+          echo "=== launchctl print system/com.apple.logind (head) ==="
+          sudo launchctl print system/com.apple.logind 2>&1 | head -30
+          echo "=== who owns /System/Library/CoreServices/logind ==="
+          ls -la /System/Library/CoreServices/logind 2>&1
+          codesign -d --entitlements - /System/Library/CoreServices/logind 2>&1 | head -20
