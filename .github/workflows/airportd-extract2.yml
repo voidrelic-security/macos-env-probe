@@ -1,0 +1,56 @@
+name: airportd-extract2
+on:
+  workflow_dispatch:
+
+jobs:
+  extract-arm64:
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 8
+    steps:
+      - name: grab
+        run: |
+          set +e
+          mkdir -p /tmp/ap
+          B=/usr/libexec/airportd
+          file "$B"; lipo -info "$B"; shasum -a 256 "$B"
+          lipo -thin arm64e "$B" -output /tmp/ap/airportd.arm64e 2>/dev/null || cp "$B" /tmp/ap/airportd.arm64e
+          otool -tV /tmp/ap/airportd.arm64e > /tmp/ap/text.asm 2>/dev/null
+          otool -Iv /tmp/ap/airportd.arm64e > /tmp/ap/imports.txt 2>/dev/null
+          echo "=== arch-independent quick facts ==="
+          wc -l /tmp/ap/text.asm /tmp/ap/imports.txt
+          echo "--- CWFXPC / auditToken selectors ---"
+          strings -a /tmp/ap/airportd.arm64e | grep -E 'auditToken|didUserConfirm|CWFXPC.*Entitlement' | sort -u | head -40
+          echo "--- entitlement-ish strings ---"
+          strings -a /tmp/ap/airportd.arm64e | grep -E '^com\.apple\.[A-Za-z0-9._-]+$' | sort -u | head -80
+          tar czf /tmp/ap-arm64.tar.gz -C /tmp/ap .
+          ls -la /tmp/ap-arm64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airportd-arm64
+          path: /tmp/ap-arm64.tar.gz
+          retention-days: 3
+
+  extract-x64:
+    runs-on: macos-13
+    continue-on-error: true
+    timeout-minutes: 8
+    steps:
+      - name: grab
+        run: |
+          set +e
+          mkdir -p /tmp/ap
+          B=/usr/libexec/airportd
+          file "$B"; lipo -info "$B"; shasum -a 256 "$B"
+          cp "$B" /tmp/ap/airportd.bin
+          otool -tV /tmp/ap/airportd.bin > /tmp/ap/text.asm 2>/dev/null
+          otool -Iv /tmp/ap/airportd.bin > /tmp/ap/imports.txt 2>/dev/null
+          wc -l /tmp/ap/text.asm /tmp/ap/imports.txt
+          strings -a /tmp/ap/airportd.bin | grep -E 'auditToken|didUserConfirm|CWFXPC.*Entitlement' | sort -u | head -40
+          tar czf /tmp/ap-x64.tar.gz -C /tmp/ap .
+          ls -la /tmp/ap-x64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airportd-x64
+          path: /tmp/ap-x64.tar.gz
+          retention-days: 3
