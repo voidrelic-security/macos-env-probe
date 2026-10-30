@@ -1,0 +1,72 @@
+name: logind-reach2
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: probe com.apple.logind
+        run: |
+          set +e
+          echo "runner=${{ matrix.os }}  sw_vers: $(sw_vers -productVersion)"
+          mkdir -p /tmp/lp
+          cat > /tmp/lp/p.m <<'OBJCEOF'
+          #import <Foundation/Foundation.h>
+          @protocol LFLogindProbe
+          - (void)SMGetCurrentSessionID:(void(^)(id))r;
+          - (void)SMGetAllSessions:(void(^)(id))r;
+          - (void)SACopyAutologinPassword:(void(^)(id))r;
+          @end
+          static void connOnly(NSString *svc){
+            NSXPCConnection *c=[[NSXPCConnection alloc] initWithMachServiceName:svc options:NSXPCConnectionPrivileged];
+            c.remoteObjectInterface=[NSXPCInterface interfaceWithProtocol:@protocol(LFLogindProbe)];
+            __block NSString *o=@"ALIVE_2S (accepted)";
+            dispatch_semaphore_t s=dispatch_semaphore_create(0);
+            c.invalidationHandler=^{o=@"INVALIDATED";dispatch_semaphore_signal(s);};
+            c.interruptionHandler=^{o=@"INTERRUPTED";dispatch_semaphore_signal(s);};
+            [c resume];
+            dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW, 2ull*NSEC_PER_SEC));
+            printf("%-40s %s\n",[svc UTF8String],[o UTF8String]); fflush(stdout);
+            [c invalidate];
+          }
+          static void callOne(NSString *lbl, void(^inv)(id<LFLogindProbe>,dispatch_semaphore_t)){
+            NSXPCConnection *c=[[NSXPCConnection alloc] initWithMachServiceName:@"com.apple.logind" options:NSXPCConnectionPrivileged];
+            c.remoteObjectInterface=[NSXPCInterface interfaceWithProtocol:@protocol(LFLogindProbe)];
+            __block NSString *o=@"<no reply>";
+            dispatch_semaphore_t s=dispatch_semaphore_create(0);
+            c.invalidationHandler=^{o=@"INVALIDATED";dispatch_semaphore_signal(s);};
+            [c resume];
+            id<LFLogindProbe> p=[c remoteObjectProxyWithErrorHandler:^(NSError *e){
+              o=[NSString stringWithFormat:@"XPC_ERROR %@/%ld %@",e.domain,(long)e.code,e.localizedDescription];
+              dispatch_semaphore_signal(s);}];
+            inv(p,s);
+            long r=dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW, 4ull*NSEC_PER_SEC));
+            if(r!=0) o=@"TIMEOUT(4s)";
+            printf("%-40s %s\n",[lbl UTF8String],[o UTF8String]); fflush(stdout);
+            [c invalidate];
+          }
+          int main(void){ @autoreleasepool {
+            printf("uid=%d euid=%d\n",getuid(),geteuid());
+            connOnly(@"com.apple.logind");
+            connOnly(@"com.apple.security.syspolicy.exec");
+            callOne(@"SMGetCurrentSessionID:",^(id<LFLogindProbe> p,dispatch_semaphore_t s){
+              [p SMGetCurrentSessionID:^(id v){printf("   reply %s\n",[[v description] UTF8String]);dispatch_semaphore_signal(s);}];});
+            callOne(@"SMGetAllSessions:",^(id<LFLogindProbe> p,dispatch_semaphore_t s){
+              [p SMGetAllSessions:^(id v){printf("   reply %s\n",[[v description] UTF8String]);dispatch_semaphore_signal(s);}];});
+            callOne(@"SACopyAutologinPassword:",^(id<LFLogindProbe> p,dispatch_semaphore_t s){
+              [p SACopyAutologinPassword:^(id v){printf("   reply len=%lu\n",(unsigned long)[[v description] length]);dispatch_semaphore_signal(s);}];});
+          } return 0; }
+          OBJCEOF
+          clang -fobjc-arc -framework Foundation -o /tmp/lp/p /tmp/lp/p.m 2>&1 | tail -10
+          codesign -s - /tmp/lp/p 2>&1
+          echo "--- run ---"
+          /tmp/lp/p 2>&1
+          echo "--- launchctl ---"
+          sudo launchctl print system/com.apple.logind 2>&1 | head -20
